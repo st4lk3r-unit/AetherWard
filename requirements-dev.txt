@@ -1,0 +1,9 @@
+-r requirements.txt
+gpsd-py3
+pyyaml
+pyrtlsdr
+scapy>=2.5
+pytest
+pytest-cov
+mypy
+ruff

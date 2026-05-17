@@ -1,0 +1,4 @@
+numpy>=1.24
+
+# Optional — required by NL80211Backend (WiFi capture)
+# scapy>=2.5

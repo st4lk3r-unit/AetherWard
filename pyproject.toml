@@ -1,0 +1,39 @@
+[build-system]
+requires      = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "aetherward"
+version     = "0.2.2"
+description = "AetherWard (AW) — RF observation framework"
+license     = "WTFPL"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+gps   = ["gpsd-py3"]
+yaml  = ["pyyaml"]
+sdr   = ["pyrtlsdr"]
+dev   = ["pytest", "pytest-cov", "mypy", "ruff"]
+
+[project.scripts]
+aetherward = "cli.aetherward:main"
+aw         = "cli.aetherward:main"   # short alias
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aetherward*", "cli*", "plugins*"]
+
+[tool.ruff]
+line-length    = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version      = "3.11"
+strict              = true
+ignore_missing_imports = true

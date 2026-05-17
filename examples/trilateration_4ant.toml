@@ -1,0 +1,57 @@
+# AetherWard — example TDOA trilateration config, 4-antenna square array
+# Antenna spacing: 1 m.  PPS sync required for useful accuracy.
+mode     = "trilateration"
+array_id = "tdoa-square"
+
+[[antennas]]
+id       = "ant-ref"
+backend  = "plugins.wifi_nl80211.NL80211Backend"
+position = [0.0, 0.0, 0.0]
+orientation_euler = [0.0, 0.0, 0.0]
+[antennas.backend_config]
+interface = "wlan0"
+
+[[antennas]]
+id       = "ant-east"
+backend  = "plugins.wifi_nl80211.NL80211Backend"
+position = [1.0, 0.0, 0.0]    # 1 m east of reference
+orientation_euler = [0.0, 0.0, 0.0]
+[antennas.backend_config]
+interface = "wlan1"
+
+[[antennas]]
+id       = "ant-north"
+backend  = "plugins.wifi_nl80211.NL80211Backend"
+position = [0.0, 1.0, 0.0]    # 1 m north of reference
+orientation_euler = [0.0, 0.0, 0.0]
+[antennas.backend_config]
+interface = "wlan2"
+
+[[antennas]]
+id       = "ant-up"
+backend  = "plugins.wifi_nl80211.NL80211Backend"
+position = [0.0, 0.0, 1.0]    # 1 m above reference (3-D solve)
+orientation_euler = [0.0, 0.0, 0.0]
+[antennas.backend_config]
+interface = "wlan3"
+
+[gps]
+backend = "gpsd"
+
+[imu]
+backend = "serial"
+device  = "/dev/ttyUSB1"
+baud    = 115200
+
+[sync]
+source = "pps"
+device = "/dev/pps0"
+
+[mode_config]
+channel            = 6
+reference_antenna  = "ant-ref"
+correlation_window = 0.001
+
+[output]
+format = "json"
+path   = "/tmp/aw-tdoa.jsonl"
