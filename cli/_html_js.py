@@ -68,16 +68,30 @@ function _updateMapCenter(){
   const c=map.getCenter(), el=document.getElementById('map-center');
   if(el) el.textContent=c.lat.toFixed(6)+',  '+c.lng.toFixed(6);
 }
+const _TILE_SOURCES = {
+  'CartoDB Dark':   {url:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',    opts:{subdomains:'abcd',maxZoom:19,attribution:'&copy; <a href="https://openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'}},
+  'CartoDB No Lbl': {url:'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',opts:{subdomains:'abcd',maxZoom:19,attribution:'&copy; <a href="https://openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'}},
+  'Stadia Dark':    {url:'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png',opts:{maxZoom:20,attribution:'&copy; <a href="https://stadiamaps.com">Stadia Maps</a> &copy; <a href="https://openstreetmap.org">OSM</a>'}},
+  'ESRI Dark Gray': {url:'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',opts:{maxZoom:16,attribution:'&copy; <a href="https://esri.com">Esri</a>'}},
+};
+let _tileLayer = null;
+function _switchTile(name) {
+  const src = _TILE_SOURCES[name]; if (!src || !map) return;
+  if (_tileLayer) { map.removeLayer(_tileLayer); }
+  _tileLayer = L.tileLayer(src.url, src.opts).addTo(map);
+  localStorage.setItem('aw_tile', name);
+  document.querySelectorAll('.tile-btn').forEach(b => b.classList.toggle('tile-btn-active', b.dataset.tile === name));
+}
 function initMap() {
   if (map) return;
   map = L.map('map',{preferCanvas:true}).setView([48.8566,2.3522],13);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
-    attribution:'&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> &copy; <a href="https://carto.com">CARTO</a>',
-    subdomains:'abcd',maxZoom:19
-  }).addTo(map);
+  const saved = localStorage.getItem('aw_tile') || 'CartoDB Dark';
+  _switchTile(Object.keys(_TILE_SOURCES).includes(saved) ? saved : 'CartoDB Dark');
   map.on('move',_updateMapCenter);
   _updateMapCenter();
   Object.values(srcs).forEach(updateMarker);
+  // Activate saved button after DOM is ready
+  document.querySelectorAll('.tile-btn').forEach(b => b.classList.toggle('tile-btn-active', b.dataset.tile === saved));
 }
 function mkColor(m){return m==='tdoa'?'#ff3c3c':m==='rssi_centroid'?'#f0c040':m==='manual'?'#706082':'#60a5fa'}
 function mkIcon(m){
@@ -347,7 +361,6 @@ function updateHeader(){
   document.getElementById('hdr-upd').textContent=totalUpd+' updates';
   document.getElementById('s-total').textContent=all.length;
   document.getElementById('s-rss').textContent=all.filter(r=>r.pos_method==='rss_trilateration').length;
-  document.getElementById('s-tdoa').textContent=all.filter(r=>r.pos_method==='tdoa').length;
   document.getElementById('s-cen').textContent=all.filter(r=>r.pos_method==='rssi_centroid').length;
   document.getElementById('s-upd').textContent=totalUpd;
 }
@@ -1100,14 +1113,20 @@ document.addEventListener('mouseout',e=>{
 let _detCache=null;
 
 function _renderDetectHtml(d){
+  const serial=d.serial||[];
+  const serialV=serial.length?serial.join(', '):'none found';
+  const gpsdHint=serial.length&&!d.gpsd
+    ?` <span style="color:var(--mu);font-size:.75rem">→ sudo gpsd ${serial[0]} -F /var/run/gpsd.sock</span>`
+    :'';
   const items=[
     {l:'WiFi interfaces', v:d.wifi_ifaces?.length?d.wifi_ifaces.join(', '):'none found', ok:d.wifi_ifaces?.length>0},
+    {l:'Serial ports (GPS)', v:serialV+gpsdHint, ok:serial.length>0},
     {l:'gpsd (localhost:2947)', v:d.gpsd?'running':'not detected', ok:d.gpsd},
     {l:'RTL-SDR (pyrtlsdr)', v:d.rtlsdr?'available':'not installed', ok:d.rtlsdr},
     {l:'C core (libaw.so)', v:d.c_core?'loaded':'Python fallback active', ok:d.c_core},
     {l:'PPS device (/dev/pps*)', v:d.pps?'found':'not found', ok:d.pps},
   ];
-  return items.map(i=>`<div style="display:flex;gap:.55rem;align-items:center;font-size:.81rem;margin-bottom:.35rem">
+  return items.map(i=>`<div style="display:flex;gap:.55rem;align-items:baseline;font-size:.81rem;margin-bottom:.35rem">
     <span style="color:${i.ok?'var(--grn)':'var(--mu)'}">●</span>
     <span style="color:var(--mu);min-width:170px">${i.l}</span>
     <span style="color:${i.ok?'var(--txt)':'var(--mu)'}">${i.v}</span>

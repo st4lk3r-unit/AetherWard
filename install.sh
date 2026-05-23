@@ -307,7 +307,8 @@ ok "AetherWard installed"
 
 # ── Create aetherward launcher (venv only) ────────────────────────────────────
 if [[ "$INSTALL_TARGET" == venv ]]; then
-    LAUNCHER="$REPO_DIR/aetherward"
+    mkdir -p "$REPO_DIR/bin"
+    LAUNCHER="$REPO_DIR/bin/aetherward"
     cat > "$LAUNCHER" <<LAUNCHER_EOF
 #!/usr/bin/env bash
 exec "${VENV_DIR}/bin/aetherward" "\$@"
@@ -323,7 +324,7 @@ echo
 case "$INSTALL_TARGET" in
     venv)
         echo -e "  Run:  ${CYN}source ${VENV_DIR}/bin/activate${RST}  then  ${CYN}aetherward${RST}"
-        echo -e "  Or:   ${CYN}${REPO_DIR}/aetherward${RST}  (no activation needed)"
+        echo -e "  Or:   ${CYN}${REPO_DIR}/bin/aetherward${RST}  (no activation needed)"
         ;;
     user)
         echo -e "  Run:  ${CYN}aetherward${RST}"

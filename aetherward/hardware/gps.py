@@ -31,54 +31,108 @@ class GPSBackend(ABC):
 class GPSDBackend(GPSBackend):
     """
     gpsd-based GNSS backend.
-    Requires gpsd running and gpsd-py3 installed.
+    Speaks the gpsd JSON-over-TCP protocol directly — no gpsd-py3 required.
     Accuracy: 1-10 m (consumer), <1 m (RTK).
     """
 
     def __init__(self, host: str = 'localhost', port: int = 2947):
-        self._host    = host
-        self._port    = port
-        self._session = None
+        self._host = host
+        self._port = port
+        self._sock: Optional[object] = None
+        self._buf  = ''
 
     def initialize(self) -> None:
+        import socket, select as _sel
         try:
-            import gps as gpsd
-            self._gpsd    = gpsd
-            self._session = gpsd.gps(
-                host=self._host, port=self._port,
-                mode=gpsd.WATCH_ENABLE | gpsd.WATCH_NEWSTYLE,
+            s = socket.create_connection((self._host, self._port), timeout=5)
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot connect to gpsd at {self._host}:{self._port}: {e}\n"
+                "  Install gpsd:  sudo apt install gpsd\n"
+                "  Start gpsd:    sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock\n"
+                "  (replace /dev/ttyUSB0 with your dongle device)"
             )
-        except ImportError:
-            raise RuntimeError("Install gpsd-py3: pip install gpsd-py3")
+        s.settimeout(None)  # blocking mode; we control timing via select
+        self._sock = s
+        # Drain the VERSION banner gpsd sends on connect
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            r, _, _ = _sel.select([s], [], [], 0.2)
+            if not r:
+                break
+            try:
+                s.recv(4096)
+            except OSError:
+                break
 
     def get_position(self) -> Optional[AbsolutePosition]:
-        if self._session is None:
+        if self._sock is None:
             return None
+        import json, select as _sel
+        # Request current snapshot — no streaming race conditions
         try:
-            report = self._session.next()
-        except Exception:
+            self._sock.sendall(b'?POLL;\n')  # type: ignore[attr-defined]
+        except OSError:
+            self._sock = None
             return None
-        if report.get('class') != 'TPV':
-            return None
-        _fix_map = {0: FixType.NONE, 1: FixType.NONE,
-                    2: FixType.FIX_2D, 3: FixType.FIX_3D}
-        fix = _fix_map.get(report.get('mode', 0), FixType.NONE)
-        if fix == FixType.NONE:
-            return None
-        return AbsolutePosition(
-            lat=report.get('lat', 0.0),
-            lon=report.get('lon', 0.0),
-            alt=report.get('alt', 0.0),
-            accuracy_h=report.get('eph', float('inf')),
-            accuracy_v=report.get('epv', float('inf')),
-            timestamp=report.get('time', 0.0),
-            fix_type=fix,
-        )
+        # Read until we receive the POLL response (usually < 100 ms)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            r, _, _ = _sel.select([self._sock], [], [], 0.3)
+            if not r:
+                break
+            try:
+                chunk = self._sock.recv(4096).decode('utf-8', errors='replace')  # type: ignore[attr-defined]
+            except OSError:
+                self._sock = None
+                return None
+            if not chunk:          # connection closed by gpsd
+                self._sock = None
+                return None
+            self._buf += chunk
+            while '\n' in self._buf:
+                line, self._buf = self._buf.split('\n', 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    report = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if report.get('class') != 'POLL':
+                    continue
+                # POLL contains a list of TPV objects (one per device)
+                for tpv in report.get('tpv', []):
+                    _fix_map = {2: FixType.FIX_2D, 3: FixType.FIX_3D}
+                    fix = _fix_map.get(tpv.get('mode', 0))
+                    if fix is None:
+                        continue
+                    ts_raw = tpv.get('time', '')
+                    try:
+                        from datetime import datetime
+                        ts = datetime.fromisoformat(
+                            ts_raw.replace('Z', '+00:00')).timestamp()
+                    except Exception:
+                        ts = time.time()
+                    return AbsolutePosition(
+                        lat=tpv.get('lat', 0.0),
+                        lon=tpv.get('lon', 0.0),
+                        alt=tpv.get('alt', 0.0),
+                        accuracy_h=tpv.get('eph', float('inf')),
+                        accuracy_v=tpv.get('epv', float('inf')),
+                        timestamp=ts,
+                        fix_type=fix,
+                    )
+                return None  # POLL received, no device has a fix yet
+        return None
 
     def close(self) -> None:
-        if self._session:
-            self._session.close()
-            self._session = None
+        if self._sock is not None:
+            try:
+                self._sock.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._sock = None
 
 
 class StaticGPSBackend(GPSBackend):

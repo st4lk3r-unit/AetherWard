@@ -483,7 +483,18 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
         array.add(ant)
 
     gps_be = _init_gps(cfg, array)
-    mode   = mode_cls(array, cfg.mode_config)
+
+    # Inject a frame counter so the status loop can report activity
+    _frame_count = [0]
+    mc = dict(cfg.mode_config)
+    _orig_on_obs = mc.get('on_observation')
+    def _count_frame(obs):
+        _frame_count[0] += 1
+        if _orig_on_obs:
+            _orig_on_obs(obs)
+    mc['on_observation'] = _count_frame
+
+    mode = mode_cls(array, mc)
 
     print(f'\n  {_hi("▸")} mode={_val(mode_name)}  '
           f'array={_val(cfg.array_id)}  '
@@ -493,15 +504,70 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
     stopped = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
 
+    t_start     = time.time()
+    last_status = t_start
+
     try:
         mode.start()
         while not stopped.is_set():
             time.sleep(0.25)
+            now = time.time()
+            if now - last_status >= 5.0:
+                elapsed = int(now - t_start)
+                n_src   = len(mode.sources) if hasattr(mode, 'sources') else 0
+                pos     = array.absolute_position
+                gps_str = (f'{pos.lat:.5f},{pos.lon:.5f}'
+                           if pos and pos.is_valid() else 'no fix')
+                print(
+                    f'  t={elapsed}s  frames={_frame_count[0]}'
+                    f'  sources={n_src}  gps={gps_str}',
+                    flush=True,
+                )
+                last_status = now
     finally:
         mode.stop()
         if gps_be:
             gps_be.close()
-        print(f'\n  {_ok("✓")} Session stopped.\n')
+        elapsed = int(time.time() - t_start)
+        print(f'\n  {_ok("✓")} Session stopped.'
+              f'  frames={_frame_count[0]}  sources='
+              f'{len(mode.sources) if hasattr(mode, "sources") else 0}'
+              f'  runtime={elapsed}s\n')
+
+def _autostart_gpsd(host: str, port: int) -> None:
+    """Start gpsd if not reachable, using the first detected serial GPS device."""
+    import socket, glob, subprocess
+    try:
+        s = socket.create_connection((host, port), timeout=1)
+        s.close()
+        return  # already running
+    except OSError:
+        pass
+    devices = sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))
+    if not devices:
+        return
+    dev = devices[0]
+    print(f'  {_dim("gpsd not running — auto-starting with")} {_val(dev)}')
+    try:
+        subprocess.Popen(
+            ['gpsd', dev, '-F', '/var/run/gpsd.sock'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print(f'  {_err("gpsd binary not found")} — sudo apt install gpsd', file=sys.stderr)
+        return
+    # Wait up to 4 s for gpsd to become reachable
+    for _ in range(8):
+        time.sleep(0.5)
+        try:
+            s = socket.create_connection((host, port), timeout=1)
+            s.close()
+            print(f'  {_ok("✓")} gpsd started')
+            return
+        except OSError:
+            pass
+    print(f'  {_err("gpsd started but not yet reachable")} — connection will retry', file=sys.stderr)
+
 
 def _init_gps(cfg, array):
     from aetherward.hardware.gps import (
@@ -513,6 +579,7 @@ def _init_gps(cfg, array):
     poll_interval = 1.0
     try:
         if gc.backend == 'gpsd':
+            _autostart_gpsd(gc.host, gc.port)
             be = GPSDBackend(host=gc.host, port=gc.port)
         elif gc.backend == 'static' and gc.lat is not None:
             be = StaticGPSBackend(lat=gc.lat, lon=gc.lon, alt=gc.alt)

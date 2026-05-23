@@ -285,8 +285,10 @@ def _tdoa_solve_py(array, measurements: list[dict],
     dif = np.maximum(np.linalg.norm(P - best_s, axis=1), 1e-9)
     Jf  = (1.0 / C) * ((best_s - P) / dif[:, None] - (best_s - p0)[None, :] / d0f)
     try:
-        sigma_tau2 = (best_rms / C) ** 2
-        cov_matrix = (sigma_tau2 / max(1, M - 3)) * np.linalg.inv(Jf.T @ Jf)
+        # Floor: 1 ns timing noise minimum so cov is never zero on a perfect fit
+        sigma_tau = max(best_rms / C, 1e-9)
+        raw = np.linalg.inv(Jf.T @ Jf)
+        cov_matrix = (sigma_tau ** 2 / max(1, M - 3)) * ((raw + raw.T) / 2)
     except np.linalg.LinAlgError:
         cov_matrix = np.full((3, 3), float('inf'))
 

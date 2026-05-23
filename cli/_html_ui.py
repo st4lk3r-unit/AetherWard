@@ -47,6 +47,10 @@ nav button.active{border-bottom-color:var(--acc);color:var(--acc)}
 .lc{cursor:pointer;transition:opacity .15s}.lc.hidden{opacity:.35}
 #map-wrap{flex:1;position:relative;min-height:0;overflow:hidden}
 #map{position:absolute;inset:0}
+#tile-switcher{position:absolute;bottom:.65rem;left:50%;transform:translateX(-50%);z-index:1000;display:flex;gap:.3rem;background:rgba(15,15,20,.75);border:1px solid var(--bdr);border-radius:20px;padding:.25rem .4rem;backdrop-filter:blur(4px)}
+.tile-btn{background:transparent;border:none;color:var(--mu);font-size:.68rem;padding:.18rem .55rem;border-radius:14px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.tile-btn:hover{color:var(--txt)}
+.tile-btn-active{background:var(--accDm);color:var(--acc)!important}
 .mf-input{height:24px;font-size:.72rem;padding:.1rem .45rem;background:var(--bg3);border:1px solid var(--bdr);color:var(--txt);border-radius:12px;outline:none;transition:border-color .15s}
 .mf-input:focus{border-color:var(--acc)}
 .mf-input::placeholder{color:var(--mu)}
@@ -206,7 +210,6 @@ input[type=checkbox]{accent-color:var(--acc)}
     <div class="stats">
       <div class="stat"><div class="stat-v" id="s-total">0</div><div class="stat-l">Sources</div></div>
       <div class="stat"><div class="stat-v" id="s-rss">0</div><div class="stat-l">RSS trilat.</div></div>
-      <div class="stat"><div class="stat-v" id="s-tdoa">0</div><div class="stat-l">TDOA</div></div>
       <div class="stat"><div class="stat-v" id="s-cen">0</div><div class="stat-l">Centroid</div></div>
       <div class="stat"><div class="stat-v" id="s-upd">0</div><div class="stat-l">Updates</div></div>
     </div>
@@ -238,6 +241,12 @@ input[type=checkbox]{accent-color:var(--acc)}
   </div>
   <div id="map-wrap">
     <div id="map"></div>
+    <div id="tile-switcher">
+      <button class="tile-btn" data-tile="CartoDB Dark"   onclick="_switchTile('CartoDB Dark')">Dark</button>
+      <button class="tile-btn" data-tile="CartoDB No Lbl" onclick="_switchTile('CartoDB No Lbl')">No Labels</button>
+      <button class="tile-btn" data-tile="Stadia Dark"    onclick="_switchTile('Stadia Dark')">Stadia</button>
+      <button class="tile-btn" data-tile="ESRI Dark Gray" onclick="_switchTile('ESRI Dark Gray')">ESRI</button>
+    </div>
     <div class="map-overlay">
       <div class="legend">
         <div style="color:var(--acc);font-weight:600;margin-bottom:.45rem;font-size:.73rem;letter-spacing:.05em">METHOD</div>
