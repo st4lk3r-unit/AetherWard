@@ -359,7 +359,7 @@ def _get_config_raw(name: str) -> dict | None:
 
 def _detect_hardware() -> dict:
     result: dict = {'wifi_ifaces': [], 'gpsd': False, 'rtlsdr': False,
-                    'c_core': False, 'pps': False}
+                    'c_core': False, 'pps': False, 'serial': []}
     # WiFi interfaces
     try:
         r = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=3)
@@ -383,6 +383,11 @@ def _detect_hardware() -> dict:
         s.close(); result['gpsd'] = True
     except Exception:
         pass
+    # Serial ports (GPS dongles appear here as /dev/ttyUSB* or /dev/ttyACM*)
+    import glob as _glob
+    result['serial'] = sorted(
+        _glob.glob('/dev/ttyUSB*') + _glob.glob('/dev/ttyACM*')
+    )
     # RTL-SDR
     try:
         import importlib as _il

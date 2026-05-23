@@ -53,8 +53,9 @@ class WardriverMode(ScanMode):
         self._assign_channels()
 
         if self._output_path:
-            os.makedirs(os.path.dirname(os.path.abspath(self._output_path)), exist_ok=True)
-            self._out_file = open(self._output_path, 'a', buffering=1)
+            path = os.path.expanduser(self._output_path)
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self._out_file = open(path, 'a', buffering=1)
 
         for ant in self.array.antennas:
             if ant.backend is None:
@@ -171,10 +172,13 @@ class WardriverMode(ScanMode):
         }
         proto = obs.frame.metadata.get('protocol')
         ident = obs.frame.metadata.get('identifier')
+        ssid  = obs.frame.metadata.get('ssid')
         if proto:
             rec['protocol'] = proto
         if ident:
             rec['id'] = ident
+        if ssid:
+            rec['ssid'] = ssid
         if gps is not None and gps.is_valid():
             rec['lat'] = gps.lat
             rec['lon'] = gps.lon

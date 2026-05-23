@@ -23,27 +23,47 @@ AetherWard ties together three things most tools conflate:
 
 Swap a WiFi NIC for an SDR, a LoRa dongle, or a custom driver without touching any solver code.
 
-| Mode | Technique | Hardware | Typical accuracy |
-|------|-----------|----------|-----------------|
-| `wardriver` | RSS trilateration | 1+ WiFi NIC, GPS | 5–50 m |
-| `trilateration` | TDOA / hyperbolic | 4+ synced NICs, GPS, PPS | 0.3–3 m |
-| `array_sensing` | RSSI/CSI variance | 2+ NICs | direction vector |
+| Mode | Technique | Hardware | Typical accuracy | State |
+|------|-----------|----------|-----------------|-------|
+| `wardriver` | RSS trilateration | 1+ WiFi NIC, GPS | 5–50 m | OK |
+| `trilateration` | TDOA / hyperbolic | 4+ synced NICs, GPS, PPS | 0.3–3 m | ⚠ WIP |
+| `array_sensing` | RSSI/CSI variance | 2+ NICs | direction vector | ⚠ WIP |
 
 ## Install
 
+AetherWard is not on PyPI — install directly from the source tree:
+
 ```bash
-pip install aetherward
+git clone <repo-url>
+cd AetherWard
+
+# create and activate a virtualenv (recommended)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# install the package and its entry points
+pip install .
 
 # optional extras
-pip install "aetherward[gps]"          # gpsd-py3
-pip install "aetherward[gps,yaml]"     # + pyyaml
-
-# install aw / aetherward commands to PATH
-aetherward install
+pip install ".[yaml]"   # YAML config support (pyyaml)
+pip install ".[sdr]"    # RTL-SDR backend (pyrtlsdr)
+pip install ".[dev]"    # pytest, mypy, ruff
 ```
 
 Requires **Python 3.11+** and **numpy ≥ 1.24**. Everything else is optional.  
 See [docs/backends.md](docs/backends.md) for per-backend requirements.
+
+After `pip install .`, the `aetherward` and `aw` commands are available in the virtualenv.  
+To install them system-wide (outside a venv), run `sudo aetherward install`.
+
+**GPS:** install the `gpsd` system daemon and plug in a GNSS dongle:
+
+```bash
+sudo apt install gpsd
+sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock   # replace with your device
+```
+
+AetherWard connects to gpsd automatically when `gps.backend = "gpsd"` is set in config.
 
 ## Quick start
 
@@ -55,7 +75,7 @@ sudo aetherward run        # start capturing (needs CAP_NET_ADMIN or root)
 aetherward web --open      # live map in browser
 ```
 
-**TDOA (4 antennas, PPS sync):**
+**TDOA (⚠ work in progress — 4 antennas, PPS sync):**
 
 ```bash
 sudo aetherward run examples/trilateration_4ant.toml
@@ -145,20 +165,9 @@ Append-only JSONL. One record per observation. Open with any editor, stream with
 
 **Wardriver record:**
 ```json
-{"id": "aa:bb:cc:dd:ee:ff", "ssid": "Home", "rssi": -62.0,
- "lat": 48.8566, "lon": 2.3522, "freq": 2412000000, "t": 1716000000.1}
-```
-
-**TDOA / ENU position:**
-```json
-{"id": "src-0", "x_enu": 3.51, "y_enu": -1.20, "z_enu": 0.0,
- "rssi": -55.0, "method": "tdoa", "t": 1716000001.0}
-```
-
-**Array sensing event:**
-```json
-{"type": "presence", "antenna_id": "wlan0", "variance": 0.183,
- "direction": [0.707, 0.707, 0.0], "t": 1716000002.5}
+{"t": 1716000000.1, "freq": 2412000000, "bw": 20000000, "rssi": -62.0,
+ "ant": "wlan0", "protocol": "802.11", "id": "aa:bb:cc:dd:ee:ff",
+ "ssid": "Home", "lat": 48.8566, "lon": 2.3522, "alt": 35.0, "fix": 3}
 ```
 
 Full format reference in [docs/session-format.md](docs/session-format.md).
@@ -227,4 +236,3 @@ plugins/
 **Coordinate systems:** absolute (WGS84, lat/lon/alt) and relative (local ENU, metres) are strictly separated. All geometry math lives in ENU; projection to WGS84 is always explicit.
 
 **Optional C core:** `libaw.so` in the package root provides ~10× faster TDOA solving. The pure-Python fallback is always active. Check: `aetherward info`.
-
