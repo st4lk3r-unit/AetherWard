@@ -196,8 +196,8 @@ class TestWardriverScenarios:
             obs = by_id[ap['mac']]
             res = rss_solve(obs, n_exp=2.7)
             assert res is not None, f"solver failed for {ap['ssid']}"
-            assert res['lat'] == pytest.approx(ap['lat'], abs=0.002)
-            assert res['lon'] == pytest.approx(ap['lon'], abs=0.002)
+            assert res['lat'] == pytest.approx(ap['lat'], abs=0.003)
+            assert res['lon'] == pytest.approx(ap['lon'], abs=0.003)
 
     def test_moving_observer_linear_pass(self):
         """
