@@ -23,9 +23,9 @@ AetherWard ties together three things most tools conflate:
 
 Swap a WiFi NIC for an SDR, a LoRa dongle, or a custom driver without touching any solver code.
 
-| Mode | Technique | Hardware | Typical accuracy |
-|------|-----------|----------|-----------------|
-| `wardriver` | RSS trilateration | 1+ WiFi NIC, GPS | 5–50 m |
+| Mode | Technique | Hardware | Typical accuracy | State |
+|------|-----------|----------|-----------------|-------|
+| `wardriver` | RSS trilateration | 1+ WiFi NIC, GPS | 5–50 m | OK |
 | `trilateration` | TDOA / hyperbolic | 4+ synced NICs, GPS, PPS | 0.3–3 m | ⚠ WIP |
 | `array_sensing` | RSSI/CSI variance | 2+ NICs | direction vector | ⚠ WIP |
 
