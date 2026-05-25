@@ -1,6 +1,7 @@
 """Wizard steps, step runner, and quick/custom paths for the aetherward CLI."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from cli.aetherward import (
@@ -294,20 +295,19 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
 
     def _step_output(ctx: dict) -> dict:
         _sep('Output')
-        session_name = _ask_str(
-            'Session name', 'wardrive',
-            hint='saved as ~/.aetherward/sessions/<name>-<timestamp>.jsonl',
+        out_path = _ask_str(
+            'Save captures to', str(Path.home() / '.aetherward' / 'sessions' / 'aw-session.jsonl'),
+            hint='.jsonl — one JSON record per frame',
             help_text=(
-                'Session name',
-                'AetherWard will create a timestamped JSONL file under\n'
-                '  ~/.aetherward/sessions/\n\n'
-                'Example:\n'
-                '  wardrive-20260525-155800.jsonl\n\n'
-                'Use [output] path manually in a config file only when you\n'
-                'need to force an exact output file.'
+                'Output file path',
+                'Every captured frame is appended as a single JSON line.\n'
+                'The file is created on first capture and never truncated,\n'
+                'so you can safely resume interrupted sessions.\n\n'
+                'Open in another terminal while running:\n'
+                '  tail -f ~/.aetherward/sessions/aw-session.jsonl | jq .'
             ),
         )
-        return {'session_name': session_name}
+        return {'out_path': out_path}
 
     def _step_imu(ctx: dict) -> dict:
         mode = ctx['mode']
@@ -339,7 +339,7 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
     mode = ctx['mode']
     sel  = ctx['selected_ifaces']
     freq = ctx['freq']
-    session_name = ctx['session_name']
+    out  = ctx['out_path']
     imu  = ctx['imu']
     gps  = ctx['gps']
 
@@ -358,7 +358,8 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
 
     mc: dict = {}
     if mode == 'wardriver':
-        mc = {'channels': list(range(1, 14)), 'hop_interval': 0.1}
+        mc = {'channels': list(range(1, 14)), 'hop_interval': 0.1,
+              'output_path': out, 'store_raw_frames': True}
     elif mode == 'trilateration':
         mc = {'channel': 6, 'reference_antenna': antennas[0]['id'],
               'correlation_window': 0.001, 'group_timeout': 0.05}
@@ -374,7 +375,7 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
         'imu':         imu,
         'sync':        {'source': 'software'},
         'mode_config': mc,
-        'output':      {'format': 'jsonl', 'session_name': session_name},
+        'output':      {'format': 'jsonl', 'path': out},
     }
 
 
@@ -579,6 +580,7 @@ def _wizard_custom(hw: dict) -> Optional[dict]:  # noqa: C901
 
     def _step_output(ctx: dict) -> dict:
         mode = ctx['mode']
+        mc   = ctx['mc']
         _sep('Output')
         out_fmt = _choose('Format', [
             ('jsonl', 'JSON Lines', 'one JSON object per frame  (.jsonl)'),
@@ -589,7 +591,7 @@ def _wizard_custom(hw: dict) -> Optional[dict]:  # noqa: C901
             'The format in which captured observations are written to disk.\n\n'
             '  JSON Lines  — One JSON object per line, newline-delimited.\n'
             '    Easy to stream, grep, and pipe to jq.\n'
-            '    tail -f ~/.aetherward/sessions/<session-name>-<timestamp>.jsonl | jq .\n\n'
+            '    tail -f session.jsonl | jq .rssi\n\n'
             '  CSV         — Comma-separated, Excel-compatible.\n'
             '    Good for post-processing in pandas or spreadsheets.\n\n'
             '  None        — No file.  Use when only the callback API\n'
@@ -597,19 +599,10 @@ def _wizard_custom(hw: dict) -> Optional[dict]:  # noqa: C901
         ))
         output: dict = {'format': out_fmt}
         if out_fmt != 'none':
-            session_name = _ask_str(
-                'Session name', mode,
-                hint='saved as ~/.aetherward/sessions/<name>-<timestamp>.' + out_fmt,
-                help_text=(
-                    'Session name',
-                    'AetherWard will create a timestamped session file under\n'
-                    '  ~/.aetherward/sessions/\n\n'
-                    'The runner resolves this into a concrete path when the\n'
-                    'session starts, so repeated runs do not overwrite old\n'
-                    'captures.'
-                ),
-            )
-            output['session_name'] = session_name
+            output['path'] = _ask_str('Path', str(Path.home() / '.aetherward' / 'sessions' / f'aw-session.{out_fmt}'))
+            if mode == 'wardriver':
+                mc['output_path'] = output['path']
+                mc.setdefault('store_raw_frames', True)
         return {'output': output}
 
     runner.add('mode',        _step_mode)

@@ -37,6 +37,8 @@ from typing import Optional
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.showcase
+
 from aetherward.antenna.antenna import Antenna
 from aetherward.antenna.array import AntennaArray
 from aetherward.core import tdoa_solve

@@ -105,7 +105,7 @@ def _run_solver(session_path: str, config_name: Optional[str],
                 n_exp: float, min_obs: int) -> None:
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
-    from aetherward.session import observer_point, receiver_id, signal_meta, source_id
+    from aetherward.session import record_source_id, source_meta_from_record
 
     array = None; tdoa_solve = None; corr_win = 1e-3; ref_id = ''
     if config_name:
@@ -151,15 +151,15 @@ def _run_solver(session_path: str, config_name: Optional[str],
             except ValueError:
                 continue
             new_recs += 1
-            sid = source_id(rec)
-            pt = observer_point(rec)
-            if pt is not None:
-                lat, lon, _alt, rssi, _acc = pt
-                rss_obs[sid].append((lat, lon, rssi))
+            sid = record_source_id(rec)
+            if rec.get('lat') is not None:
+                rss_obs[sid].append((rec['lat'], rec['lon'], rec.get('rssi', -100.0)))
                 _geo_recs += 1
             if sid not in rss_meta:
-                rss_meta[sid] = signal_meta(rec)
-            if tdoa_solve and receiver_id(rec):
+                rss_meta[sid] = source_meta_from_record(rec)
+                rss_meta[sid].setdefault('ssid', '')
+                rss_meta[sid].setdefault('protocol', '')
+            if tdoa_solve and rec.get('ant'):
                 bucket = int(rec.get('t', 0.0) / corr_win)
                 tdoa_buf[(sid, bucket)].append(rec)
 
@@ -177,13 +177,6 @@ def _run_solver(session_path: str, config_name: Optional[str],
                            'samples': len(obs)}
             else:
                 continue
-            if 'confidence_radius_m' not in pos_rec:
-                res = pos_rec.get('residual_dBm') or pos_rec.get('rss_residual') or 8.0
-                radius = max(25.0, float(res) * 18.0)
-                if len(obs) < 8:
-                    radius *= 1.5
-                pos_rec['confidence_radius_m'] = round(radius, 1)
-                pos_rec['confidence'] = 'medium' if len(obs) >= 8 and float(res) <= 10.0 else 'low'
             prev = solved.get(sid)
             if prev is None or _changed(prev, pos_rec):
                 solved[sid] = pos_rec; _broadcast(pos_rec)
@@ -215,15 +208,15 @@ def _run_solver(session_path: str, config_name: Optional[str],
 
         if tdoa_solve:
             ready = [(k, g) for k, g in tdoa_buf.items()
-                     if len({receiver_id(r) for r in g}) >= 3]
+                     if len({r['ant'] for r in g}) >= 3]
             for key, group in ready:
                 sid = key[0]
-                ant_ids = {receiver_id(r) for r in group}
-                ref = next((r for r in group if receiver_id(r) == ref_id), group[0])
-                meas = [{'antenna_id': receiver_id(r), 'tdoa': r['t']-ref['t'],
+                ant_ids = {r['ant'] for r in group}
+                ref = next((r for r in group if r['ant'] == ref_id), group[0])
+                meas = [{'antenna_id': r['ant'], 'tdoa': r['t']-ref['t'],
                          'rssi': r.get('rssi', -100.0), 'timestamp': r['t']}
                         for r in group]
-                result = tdoa_solve(array, meas, receiver_id(ref))
+                result = tdoa_solve(array, meas, ref['ant'])
                 if result and result.get('valid'):
                     pos = result.get('position_absolute') or result.get('position_relative')
                     if pos and getattr(pos, 'lat', None):
@@ -301,8 +294,6 @@ def _session_type(p: Path) -> str:
             if not line:
                 continue
             r = json.loads(line)
-            if r.get('record_type') == 'observation' or r.get('observer'):
-                return 'wardriver'
             if r.get('lat') is not None and r.get('lon') is not None:
                 return 'wardriver'
             if r.get('x_enu') is not None or r.get('y_enu') is not None:
@@ -520,11 +511,14 @@ class _Handler(BaseHTTPRequestHandler):
                         r = json.loads(raw)
                         if raw_all:
                             records.append(r)
-                        elif (r.get('lat') is not None and r.get('lon') is not None) or r.get('observer'):
-                            from aetherward.session import oldstyle_observation
-                            flat = oldstyle_observation(r)
-                            if flat.get('lat') is not None and flat.get('lon') is not None:
-                                records.append(flat)
+                        elif r.get('lat') is not None and r.get('lon') is not None:
+                            from aetherward.session import record_source_id, source_meta_from_record
+                            meta = source_meta_from_record(r)
+                            records.append({**meta, 'lat': r['lat'], 'lon': r['lon'],
+                                            't': r.get('t', 0), 'rssi': r.get('rssi'),
+                                            'id': record_source_id(r),
+                                            'freq': r.get('freq'),
+                                            'protocol': meta.get('protocol', r.get('protocol', ''))})
                     except ValueError:
                         pass
             self._json(records)
@@ -593,6 +587,7 @@ class _Handler(BaseHTTPRequestHandler):
             def _do_batch():
                 from collections import defaultdict
                 from aetherward.position.rss import rss_solve, rssi_centroid
+                from aetherward.session import record_source_id, source_meta_from_record
                 sessions = [s for s in _list_sessions()
                             if s['stype'] in ('wardriver', 'tdoa_raw', 'unknown')]
                 total_solved = 0
@@ -606,15 +601,14 @@ class _Handler(BaseHTTPRequestHandler):
                                 if not raw: continue
                                 try: rec = json.loads(raw)
                                 except ValueError: continue
-                                sid = rec.get('id') or f"anon:{rec.get('freq',0):.0f}"
+                                sid = record_source_id(rec)
                                 if rec.get('lat') is not None:
                                     rss_obs[sid].append(
                                         (rec['lat'], rec['lon'], rec.get('rssi', -100.0)))
                                 if sid not in rss_meta:
-                                    rss_meta[sid] = {
-                                        'ssid': rec.get('ssid') or '',
-                                        'freq_mhz': round((rec.get('freq') or 0) / 1e6, 3),
-                                        'protocol': rec.get('protocol') or ''}
+                                    rss_meta[sid] = source_meta_from_record(rec)
+                                    rss_meta[sid].setdefault('ssid', '')
+                                    rss_meta[sid].setdefault('protocol', '')
                     except Exception:
                         continue
                     for sid, obs in rss_obs.items():

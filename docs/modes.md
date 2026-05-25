@@ -6,14 +6,14 @@ AetherWard runs in one of three modes set by the `mode` key in your config.
 
 ## `wardriver`
 
-Scans one or more antennas across RF channels. Every captured frame is tagged with the current GPS position and written to a JSONL session file. The RSS solver estimates source positions from RSSI measurements at multiple known observer locations.
+Scans one or more antennas across RF channels. Every captured frame is tagged with the current GPS position and written to a JSONL session file with parsed metadata and optional raw bytes. The RSS solver estimates source positions from RSSI measurements at multiple known observer locations.
 
 ### How it works
 
-1. Channels are partitioned across antennas — no two antennas dwell on the same channel simultaneously.
+1. Channels are assigned to antennas that cover the channel frequency; fallback assignment remains balanced with no overlap. A single-channel config is intentionally broadcast to all receivers.
 2. Frames are grouped into `SignalSource` objects by `(frequency, identifier)`, where identifier is BSSID, MAC, or device ID extracted from the protocol header.
 3. Anonymous frames (no parseable identifier) are bucketed by frequency + 1-second time window.
-4. GPS is polled on a configurable interval; each observation snapshot includes fix type, horizontal/vertical accuracy when available, and the fix timestamp.
+4. GPS is polled on a configurable interval; each observation snapshot includes the fix at capture time.
 
 ### Config keys
 
@@ -21,8 +21,8 @@ Scans one or more antennas across RF channels. Every captured frame is tagged wi
 |-----|------|---------|-------------|
 | `channels` | `list[int]` | 1–13 | Channels to scan |
 | `hop_interval` | `float` | `0.1` | Seconds per channel dwell |
-
-Session output is controlled by `[output] session_name`, which resolves to a timestamped JSONL file under `~/.aetherward/sessions/`.
+| `output_path` | `string` | — | JSONL session output path; falls back to `[output].path` |
+| `store_raw_frames` | `bool` | `true` | Store raw frame bytes as `raw_frame_hex`/`raw_frame_b64` |
 
 ### RSS solver
 

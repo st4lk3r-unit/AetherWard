@@ -61,8 +61,14 @@ device = ""                     # e.g. /dev/pps0
 # ── Mode-specific settings ────────────────────────────────────────────────────
 [mode_config]
 # wardriver
-channels     = [1, 6, 11]
-hop_interval = 0.1
+channels         = [1, 6, 11]
+hop_interval     = 0.1
+output_path      = "~/.aetherward/sessions/session.jsonl"
+store_raw_frames = true
+
+[output]
+format = "jsonl"
+path   = "~/.aetherward/sessions/session.jsonl"
 
 # trilateration (replace mode_config block)
 # channel            = 6
@@ -79,8 +85,8 @@ hop_interval = 0.1
 # ema_alpha          = 0.3
 
 [output]
-format       = "jsonl"
-session_name = "my-rig-drive"
+format = "jsonl"
+path   = "~/.aetherward/sessions/session.jsonl"
 ```
 
 ---
@@ -149,18 +155,8 @@ Serial IMU expects JSON lines:
 |-----|------|---------|-------------|
 | `channels` | list[int] | 1–13 | Channels to scan |
 | `hop_interval` | float | `0.1` | Seconds per channel |
-
-
-### `[output]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `format` | string | `jsonl` | `jsonl`, `csv`, or `none` for capture output |
-| `session_name` | string | config name | Base name used for timestamped files in `~/.aetherward/sessions/` |
-| `path` | string | — | Legacy explicit output path; accepted for compatibility, but `session_name` is preferred |
-
-When `session_name = "roof-drive"`, the runner writes a file like
-`~/.aetherward/sessions/roof-drive-20260525-155800.jsonl`.
+| `output_path` | string | — | JSONL output path. If omitted, `[output].path` is used. |
+| `store_raw_frames` | bool | `true` | Store raw frame bytes as `raw_frame_hex`/`raw_frame_b64` |
 
 ### `[mode_config]` — trilateration
 

@@ -1,5 +1,5 @@
 """
-Comprehensive scenario tests — generates diverse JSONL session files in /tmp
+Comprehensive scenario tests — generates diverse JSONL session files under ~/.aetherward/sessions/tests/scenarios
 that can be loaded directly in the web UI to exercise every viewing mode.
 
 Scenarios
@@ -27,6 +27,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.showcase
+
 from aetherward.config.schema import AWConfig
 from aetherward.modes.wardriver import WardriverMode
 from aetherward.position.rss import rss_solve, rssi_centroid
@@ -37,6 +39,10 @@ from aetherward.position.absolute import AbsolutePosition, FixType
 
 _M_PER_DEG  = 111_320.0
 _SEED       = 2025
+SCENARIO_DIR = Path.home() / '.aetherward' / 'sessions' / 'tests' / 'scenarios'
+
+def _scenario_path(name: str) -> Path:
+    return SCENARIO_DIR / name
 
 # Paris — realistic city centre coordinates for all wardriver scenarios
 _PARIS_LAT  = 48.8566
@@ -148,7 +154,7 @@ class TestWardriverScenarios:
                       _PARIS_LAT, _PARIS_LON)
         track = _circle_track(_PARIS_LAT, _PARIS_LON, 80, 12)
         recs = _obs_from_track(ap, track, n_exp=2.5, rng=rng)
-        out = Path('/tmp/aw_single_ap_circle.jsonl')
+        out = _scenario_path('aw_single_ap_circle.jsonl')
         _write_jsonl(out, recs)
 
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
@@ -184,7 +190,7 @@ class TestWardriverScenarios:
         records = []
         for ap in aps:
             records.extend(_obs_from_track(ap, track, n_exp=2.7, rng=rng))
-        out = Path('/tmp/aw_multi_ap_five.jsonl')
+        out = _scenario_path('aw_multi_ap_five.jsonl')
         _write_jsonl(out, records)
         assert out.stat().st_size > 0
 
@@ -213,7 +219,7 @@ class TestWardriverScenarios:
             for x in range(-400, 401, 40)
         ]
         recs = _obs_from_track(ap, track, n_exp=2.5, rng=rng)
-        out = Path('/tmp/aw_linear_drive.jsonl')
+        out = _scenario_path('aw_linear_drive.jsonl')
         _write_jsonl(out, recs)
 
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
@@ -248,7 +254,7 @@ class TestWardriverScenarios:
                 'protocol': 'wifi',
                 't': round(time.time() + i * 0.3, 3),
             })
-        out = Path('/tmp/aw_fixed_sensor.jsonl')
+        out = _scenario_path('aw_fixed_sensor.jsonl')
         _write_jsonl(out, records)
         lines = out.read_text().strip().splitlines()
         assert len(lines) == 20
@@ -276,7 +282,7 @@ class TestWardriverScenarios:
         records = []
         for ap in aps:
             records.extend(_obs_from_track(ap, track, n_exp=3.2, rng=rng))
-        out = Path('/tmp/aw_dense_urban.jsonl')
+        out = _scenario_path('aw_dense_urban.jsonl')
         _write_jsonl(out, records)
         assert len(out.read_text().strip().splitlines()) == 20 * 16
 
@@ -291,7 +297,7 @@ class TestWardriverScenarios:
                       rssi_at_1m=-30)
         track = _circle_track(_PARIS_LAT, _PARIS_LON, 200, 20)
         recs = _obs_from_track(ap, track, n_exp=3.0, rng=rng, gps_jitter_m=3)
-        out = Path('/tmp/aw_weak_signal.jsonl')
+        out = _scenario_path('aw_weak_signal.jsonl')
         _write_jsonl(out, recs)
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
         # Solver should either find it within 100 m or return None (too noisy)
@@ -315,7 +321,7 @@ class TestWardriverScenarios:
         records = []
         records.extend(_obs_from_track(ap_24, track, n_exp=2.5, rng=rng))
         records.extend(_obs_from_track(ap_5,  track, n_exp=3.5, rng=rng))  # 5 GHz attenuates faster
-        out = Path('/tmp/aw_dual_band.jsonl')
+        out = _scenario_path('aw_dual_band.jsonl')
         _write_jsonl(out, records)
         # Both bands should solve to the same location
         by_id: dict = {}
@@ -353,7 +359,7 @@ class TestWardriverScenarios:
         t0 = time.time()
         for ap in aps:
             records.extend(_obs_from_track(ap, track, n_exp=2.6, rng=rng, t0=t0))
-        out = Path('/tmp/aw_car_route.jsonl')
+        out = _scenario_path('aw_car_route.jsonl')
         _write_jsonl(out, records)
         assert len(out.read_text().strip().splitlines()) == 8 * n_pts
 
@@ -373,7 +379,7 @@ class TestWardriverScenarios:
                                    rng.gauss(0, 5), rng.gauss(0, 5))
             track.append((lat, lon))
         recs = _obs_from_track(ap, track, n_exp=3.8, rng=rng, gps_jitter_m=5)
-        out = Path('/tmp/aw_indoor_nlos.jsonl')
+        out = _scenario_path('aw_indoor_nlos.jsonl')
         _write_jsonl(out, recs)
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
         res = rss_solve(obs, n_exp=3.8)
@@ -392,7 +398,7 @@ class TestWardriverScenarios:
                       rssi_at_1m=-25)
         track = _circle_track(_PARIS_LAT, _PARIS_LON, 120, 16)
         recs = _obs_from_track(ap, track, n_exp=2.1, rng=rng, gps_jitter_m=1)
-        out = Path('/tmp/aw_outdoor_los.jsonl')
+        out = _scenario_path('aw_outdoor_los.jsonl')
         _write_jsonl(out, recs)
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
         res = rss_solve(obs, n_exp=2.1)
@@ -424,7 +430,7 @@ class TestWardriverScenarios:
         track = _circle_track(_PARIS_LAT, _PARIS_LON, 120, 16)
         recs = _obs_from_track(ap_a, track[:8], n_exp=2.5, rng=rng)
         recs += _obs_from_track(ap_b, track[8:], n_exp=2.5, rng=rng)
-        out = Path('/tmp/aw_duplicate_mac.jsonl')
+        out = _scenario_path('aw_duplicate_mac.jsonl')
         _write_jsonl(out, recs)
         # All records share the same MAC
         macs = {r['id'] for r in recs}
@@ -451,7 +457,7 @@ class TestWardriverScenarios:
         track = [_geo_offset(_PARIS_LAT, _PARIS_LON, x, 0)
                  for x in range(-600, 601, 20)]
         recs = _obs_from_track(ap, track, n_exp=2.5, rng=rng, gps_jitter_m=3)
-        out = Path('/tmp/aw_highway_ap.jsonl')
+        out = _scenario_path('aw_highway_ap.jsonl')
         _write_jsonl(out, recs)
         assert len(recs) == len(track)
         obs = [(r['lat'], r['lon'], r['rssi']) for r in recs]
@@ -466,7 +472,7 @@ class TestWardriverScenarios:
 class TestMultiAntennaWardriver:
     """
     Tests the WardriverMode channel-assignment logic for 1, 2 and 3 antennas,
-    then generates matching sessions to /tmp.
+    then generates matching sessions under the tests/scenarios session folder.
     """
 
     def _session_for(self, n_antennas: int, out_path: str,
@@ -488,11 +494,11 @@ class TestMultiAntennaWardriver:
         return mode
 
     def test_single_antenna_all_channels(self):
-        mode = self._session_for(1, '/tmp/aw_1ant.jsonl')
+        mode = self._session_for(1, str(_scenario_path('aw_1ant.jsonl')))
         assert set(mode._channel_map['wlan0']) == set(range(1, 14))
 
     def test_dual_antenna_no_overlap(self):
-        mode = self._session_for(2, '/tmp/aw_2ant.jsonl')
+        mode = self._session_for(2, str(_scenario_path('aw_2ant.jsonl')))
         ch0 = mode._channel_map.get('wlan0', [])
         ch1 = mode._channel_map.get('wlan1', [])
         assert sorted(ch0 + ch1) == list(range(1, 14))
@@ -500,7 +506,7 @@ class TestMultiAntennaWardriver:
         assert abs(len(ch0) - len(ch1)) <= 1  # balanced split
 
     def test_triple_antenna_remainder(self):
-        mode = self._session_for(3, '/tmp/aw_3ant.jsonl')
+        mode = self._session_for(3, str(_scenario_path('aw_3ant.jsonl')))
         all_ch = []
         for i in range(3):
             all_ch.extend(mode._channel_map.get(f'wlan{i}', []))
@@ -509,7 +515,7 @@ class TestMultiAntennaWardriver:
     def test_five_ghz_channels_split(self):
         """5 GHz non-contiguous channel list split across 3 antennas."""
         channels = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112]
-        mode = self._session_for(3, '/tmp/aw_3ant_5ghz.jsonl',
+        mode = self._session_for(3, str(_scenario_path('aw_3ant_5ghz.jsonl')),
                                  channels=channels)
         all_ch = []
         for i in range(3):
@@ -525,7 +531,7 @@ class TestMultiAntennaWardriver:
         ch_2g = list(range(1, 14))
         ch_5g = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112]
         all_channels = ch_2g + ch_5g
-        mode = self._session_for(4, '/tmp/aw_4ant_dualband.jsonl',
+        mode = self._session_for(4, str(_scenario_path('aw_4ant_dualband.jsonl')),
                                  channels=all_channels)
         all_ch: list = []
         seen: set = set()
@@ -542,7 +548,7 @@ class TestMultiAntennaWardriver:
         Edge case: 4 antennas but only 1 channel in the list.
         All antennas should share the single channel (no crash, no empty map).
         """
-        mode = self._session_for(4, '/tmp/aw_4ant_1ch.jsonl', channels=[6])
+        mode = self._session_for(4, str(_scenario_path('aw_4ant_1ch.jsonl')), channels=[6])
         all_ch = []
         for i in range(4):
             all_ch.extend(mode._channel_map.get(f'wlan{i}', []))
@@ -596,7 +602,7 @@ class TestTdoaScenarios:
             z = true_src[2] + rng.gauss(0, 0.08)
             records.append(self._enu_record(
                 'src-0', x, y, z, rssi=-55 - trial, method='tdoa', t=t0 + trial))
-        out = Path('/tmp/aw_tdoa_4rx_precise.jsonl')
+        out = _scenario_path('aw_tdoa_4rx_precise.jsonl')
         _write_jsonl(out, records)
         xs = [r['x_enu'] for r in records if r['method'] == 'tdoa']
         ys = [r['y_enu'] for r in records if r['method'] == 'tdoa']
@@ -627,7 +633,7 @@ class TestTdoaScenarios:
                 'src-noisy', x, y, z,
                 rssi=-60 - rng.uniform(0, 10), method='tdoa',
                 t=t0 + trial * 0.1))
-        out = Path('/tmp/aw_tdoa_4rx_noisy.jsonl')
+        out = _scenario_path('aw_tdoa_4rx_noisy.jsonl')
         _write_jsonl(out, records)
         assert out.exists() and out.stat().st_size > 0
 
@@ -650,7 +656,7 @@ class TestTdoaScenarios:
                 true_src[1] + rng.gauss(0, 0.3),
                 true_src[2] + rng.gauss(0, 0.2),
                 rssi=-58, method='tdoa', t=t0 + trial))
-        out = Path('/tmp/aw_tdoa_asymmetric.jsonl')
+        out = _scenario_path('aw_tdoa_asymmetric.jsonl')
         _write_jsonl(out, records)
         assert len(out.read_text().strip().splitlines()) == len(records)
 
@@ -679,7 +685,7 @@ class TestTdoaScenarios:
                     sz + rng.gauss(0, 0.1),
                     rssi=-55 - s_idx * 5,
                     method='tdoa', t=t0 + trial + s_idx * 0.05))
-        out = Path('/tmp/aw_tdoa_two_sources.jsonl')
+        out = _scenario_path('aw_tdoa_two_sources.jsonl')
         _write_jsonl(out, records)
         src_ids = {r['id'] for r in records if r['method'] == 'tdoa'}
         assert src_ids == {'src-0', 'src-1'}
@@ -706,7 +712,7 @@ class TestTdoaScenarios:
                 'phone', true_src[0] + rng.gauss(0, 0.2),
                 true_src[1] + rng.gauss(0, 0.2), 0.0,
                 rssi=-52, method='tdoa', t=t0 + trial * 0.5))
-        out = Path('/tmp/aw_tdoa_floor_2d.jsonl')
+        out = _scenario_path('aw_tdoa_floor_2d.jsonl')
         _write_jsonl(out, records)
         assert out.exists()
 
@@ -734,7 +740,7 @@ class TestTdoaScenarios:
                 sy + rng.gauss(0, 0.12), sz + rng.gauss(0, 0.08),
                 rssi=-50 - rng.uniform(0, 5), method='tdoa',
                 t=t0 + step * 0.25))
-        out = Path('/tmp/aw_tdoa_moving_source.jsonl')
+        out = _scenario_path('aw_tdoa_moving_source.jsonl')
         _write_jsonl(out, records)
         src_pts = [r for r in records if r['method'] == 'tdoa']
         assert len(src_pts) == 20
@@ -760,7 +766,7 @@ class TestTdoaScenarios:
                 'tgt', true_src[0] + rng.gauss(0, 0.3),
                 true_src[1] + rng.gauss(0, 0.3), 0.0,
                 rssi=-60, method='tdoa', t=t0 + trial * 0.2))
-        out = Path('/tmp/aw_tdoa_3rx_min.jsonl')
+        out = _scenario_path('aw_tdoa_3rx_min.jsonl')
         _write_jsonl(out, records)
         rx_count = sum(1 for r in records if r['method'] == 'antenna')
         assert rx_count == 3
@@ -796,7 +802,7 @@ class TestTdoaScenarios:
                 true_src[1] + rng.gauss(0, 0.5),
                 true_src[2] + rng.gauss(0, 0.4),
                 rssi=-58, method='tdoa', t=t0 + step * 0.1))
-        out = Path('/tmp/aw_tdoa_dropout.jsonl')
+        out = _scenario_path('aw_tdoa_dropout.jsonl')
         _write_jsonl(out, records)
         tdoa_pts = [r for r in records if r['method'] == 'tdoa']
         # Phase 2 estimates should have higher spread
@@ -829,7 +835,7 @@ class TestTdoaScenarios:
                 true_src[2] + rng.gauss(0, 0.6),
                 rssi=-65 - rng.uniform(0, 8), method='tdoa',
                 t=t0 + step * 0.1))
-        out = Path('/tmp/aw_tdoa_multipath.jsonl')
+        out = _scenario_path('aw_tdoa_multipath.jsonl')
         _write_jsonl(out, records)
         src_pts = [r for r in records if r['method'] == 'tdoa']
         xs = [r['x_enu'] for r in src_pts]
@@ -855,7 +861,7 @@ class TestTdoaScenarios:
                 'id': f'enu-{i}', 'x_enu': float(i), 'y_enu': float(i),
                 'z_enu': 0.0, 'rssi': -50.0, 'method': 'tdoa', 't': t0 + i,
             })
-        out = Path('/tmp/aw_mixed_session.jsonl')
+        out = _scenario_path('aw_mixed_session.jsonl')
         _write_jsonl(out, records)
         lines = out.read_text().strip().splitlines()
         assert len(lines) == 8 + 5
@@ -912,7 +918,7 @@ class TestArraySensingScenarios:
         for ant in ['wlan0', 'wlan1', 'wlan2']:
             records.append(evt('absence', ant, rng.uniform(0.01, 0.04)))
 
-        out = Path('/tmp/aw_sensing_entry_exit.jsonl')
+        out = _scenario_path('aw_sensing_entry_exit.jsonl')
         _write_jsonl(out, records)
         types = [r['type'] for r in records]
         assert 'presence' in types
@@ -942,7 +948,7 @@ class TestArraySensingScenarios:
                     d = [rng.gauss(0, 0.3), rng.gauss(0, 0.3), 0.0]
                     records.append(self._sensing_event(etype, ant, var, d, t))
 
-        out = Path('/tmp/aw_sensing_multi_zone.jsonl')
+        out = _scenario_path('aw_sensing_multi_zone.jsonl')
         _write_jsonl(out, records)
         assert len(out.read_text().strip().splitlines()) == len(records)
 
@@ -960,7 +966,7 @@ class TestArraySensingScenarios:
             d = [rng.gauss(0, 0.5), rng.gauss(0, 0.5), 0.0]
             etype = rng.choice(['motion', 'motion', 'presence'])
             records.append(self._sensing_event(etype, ant, var, d, t0 + i * 0.2))
-        out = Path('/tmp/aw_sensing_crowd.jsonl')
+        out = _scenario_path('aw_sensing_crowd.jsonl')
         _write_jsonl(out, records)
         assert len(out.read_text().strip().splitlines()) == 200
 
@@ -974,7 +980,7 @@ class TestArraySensingScenarios:
             d = [rng.gauss(0, 0.3), rng.gauss(0, 0.3), 0.0]
             var = 0.02 if etype == 'absence' else rng.uniform(0.1, 0.3)
             records.append(self._sensing_event(etype, 'wlan0', var, d, t0 + i))
-        out = Path('/tmp/aw_sensing_cycle.jsonl')
+        out = _scenario_path('aw_sensing_cycle.jsonl')
         _write_jsonl(out, records)
         types = {r['type'] for r in records}
         assert types == {'presence', 'motion', 'absence'}
@@ -1312,7 +1318,7 @@ class TestConfigWorkflow:
         assert cfg.gps.backend == 'mls'
 
     def test_all_session_files_exist(self):
-        """Verify all /tmp session files generated by previous tests are present."""
+        """Verify all tests/scenarios session files generated by previous tests are present."""
         expected = [
             'aw_single_ap_circle.jsonl',
             'aw_multi_ap_five.jsonl',
@@ -1338,14 +1344,14 @@ class TestConfigWorkflow:
             'aw_sensing_crowd.jsonl',
             'aw_sensing_cycle.jsonl',
         ]
-        missing = [f for f in expected if not Path(f'/tmp/{f}').exists()]
+        missing = [f for f in expected if not _scenario_path(f).exists()]
         assert not missing, f"Missing session files: {missing}"
 
     def test_all_session_files_are_valid_jsonl(self):
         """All generated session files must contain only valid JSON lines."""
-        session_dir = Path('/tmp')
+        session_dir = SCENARIO_DIR
         files = list(session_dir.glob('aw_*.jsonl'))
-        assert files, "No session files found in /tmp"
+        assert files, "No session files found in tests/scenarios session folder"
         for f in files:
             lines = f.read_text().strip().splitlines()
             assert lines, f"{f.name} is empty"
