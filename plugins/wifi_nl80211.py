@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+import re
 from typing import Callable, Optional
 
 from aetherward.hardware.backend import BackendCapabilities, HardwareBackend
@@ -37,6 +38,98 @@ def _build_tables() -> tuple[dict[int, int], dict[int, int]]:
 
 
 _CHAN_TO_FREQ, _FREQ_TO_CHAN = _build_tables()
+
+
+def channel_to_frequency_mhz(channel: int) -> Optional[int]:
+    return _CHAN_TO_FREQ.get(int(channel))
+
+
+def frequency_to_channel(freq_mhz: float) -> Optional[int]:
+    if not freq_mhz:
+        return None
+    mhz = int(round(freq_mhz))
+    if mhz in _FREQ_TO_CHAN:
+        return _FREQ_TO_CHAN[mhz]
+    # Common formulas for channels not explicitly in the table.
+    if 2412 <= mhz <= 2472:
+        return int(round((mhz - 2412) / 5) + 1)
+    if mhz == 2484:
+        return 14
+    if 5000 <= mhz <= 5900:
+        return int(round((mhz - 5000) / 5))
+    if 5955 <= mhz <= 7115:
+        return int(round((mhz - 5950) / 5))
+    return None
+
+
+def _iter_elts(pkt, dot11elt_cls):
+    elt = pkt.getlayer(dot11elt_cls)
+    seen = 0
+    while elt is not None and seen < 256:
+        yield elt
+        seen += 1
+        try:
+            elt = elt.payload.getlayer(dot11elt_cls) if elt.payload else None
+        except Exception:
+            break
+
+
+def _safe_info(elt) -> bytes:
+    try:
+        return bytes(elt.info) if elt.info is not None else b''
+    except Exception:
+        return b''
+
+
+def _parse_rsn(info: bytes) -> dict:
+    # RSN IE (ID 48). Enough for metadata; not a full validator.
+    out = {'auth_mode': 'WPA2', 'encryption': 'WPA2', 'akm': [], 'cipher': []}
+    if len(info) < 8:
+        return out
+    pos = 2  # version
+    cipher_map = {0: 'USE-GROUP', 1: 'WEP40', 2: 'TKIP', 4: 'CCMP', 5: 'WEP104', 8: 'GCMP', 9: 'GCMP-256', 10: 'CCMP-256'}
+    akm_map = {1: '802.1X', 2: 'PSK', 3: 'FT-802.1X', 4: 'FT-PSK', 6: 'PSK-SHA256', 8: 'SAE', 18: 'OWE'}
+    try:
+        # group cipher suite
+        if pos + 4 <= len(info):
+            out['cipher'].append(cipher_map.get(info[pos + 3], f'cipher-{info[pos + 3]}'))
+        pos += 4
+        pairwise_n = int.from_bytes(info[pos:pos+2], 'little'); pos += 2
+        for _ in range(pairwise_n):
+            if pos + 4 > len(info): break
+            out['cipher'].append(cipher_map.get(info[pos + 3], f'cipher-{info[pos + 3]}'))
+            pos += 4
+        akm_n = int.from_bytes(info[pos:pos+2], 'little'); pos += 2
+        for _ in range(akm_n):
+            if pos + 4 > len(info): break
+            out['akm'].append(akm_map.get(info[pos + 3], f'akm-{info[pos + 3]}'))
+            pos += 4
+    except Exception:
+        pass
+    if 'SAE' in out['akm']:
+        out['auth_mode'] = 'WPA3-SAE'
+    elif 'PSK' in out['akm'] or 'FT-PSK' in out['akm'] or 'PSK-SHA256' in out['akm']:
+        out['auth_mode'] = 'WPA2-PSK'
+    elif out['akm']:
+        out['auth_mode'] = 'WPA2-Enterprise'
+    out['akm'] = '+'.join(dict.fromkeys(out['akm']))
+    out['cipher'] = '+'.join(dict.fromkeys(out['cipher']))
+    return out
+
+
+def _parse_wpa_vendor(info: bytes) -> dict:
+    # WPA vendor IE: 00:50:f2:01 ...
+    if len(info) >= 4 and info[:4] == b'\x00\x50\xf2\x01':
+        return {'auth_mode': 'WPA', 'encryption': 'WPA'}
+    return {}
+
+
+def _cap_privacy(pkt) -> bool:
+    try:
+        st = pkt.sprintf('{Dot11Beacon:%Dot11Beacon.cap%}{Dot11ProbeResp:%Dot11ProbeResp.cap%}')
+        return 'privacy' in st.lower()
+    except Exception:
+        return False
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
@@ -171,7 +264,7 @@ class NL80211Backend(HardwareBackend):
     def _parse(self, pkt) -> Optional[Frame]:
         try:
             from scapy.layers.dot11 import (
-                RadioTap, Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt,
+                RadioTap, Dot11, Dot11Beacon, Dot11ProbeResp, Dot11ProbeReq, Dot11Elt,
             )
         except ImportError:
             return None
@@ -180,32 +273,89 @@ class NL80211Backend(HardwareBackend):
             return None
 
         rt = pkt[RadioTap]
-        rssi     = float(getattr(rt, 'dBm_AntSignal',   None) or -100.0)
-        freq_mhz = float(getattr(rt, 'ChannelFrequency', None) or 0.0)
+        rssi = getattr(rt, 'dBm_AntSignal', None)
+        try:
+            rssi = float(rssi)
+        except Exception:
+            rssi = -100.0
+        freq_mhz = getattr(rt, 'ChannelFrequency', None)
+        try:
+            freq_mhz = float(freq_mhz or 0.0)
+        except Exception:
+            freq_mhz = 0.0
 
         if not pkt.haslayer(Dot11):
             return None
         d11 = pkt[Dot11]
 
-        meta: dict = {'protocol': '802.11'}
+        meta: dict = {
+            'protocol': '802.11',
+            'frame_type': f'{getattr(d11, "type", "?")}/{getattr(d11, "subtype", "?")}',
+        }
 
-        if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
-            # addr2 = transmitter (BSSID for AP-originated frames)
-            bssid = d11.addr3 or d11.addr2
+        is_ap_frame = pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)
+        is_probe_req = pkt.haslayer(Dot11ProbeReq)
+        if is_ap_frame or is_probe_req:
+            # AP-originated management frames normally carry BSSID in addr3;
+            # probe requests use the station MAC as transmitter/identifier.
+            bssid = (d11.addr3 or d11.addr2) if is_ap_frame else (d11.addr2 or d11.addr3)
             if bssid:
-                meta['bssid']      = bssid
-                meta['identifier'] = bssid   # wardriver source key
+                meta['bssid'] = bssid
+                meta['identifier'] = bssid
 
-            # Walk the information element chain for SSID (element ID 0)
-            elt = pkt.getlayer(Dot11Elt)
-            while elt is not None:
-                if elt.ID == 0:
-                    raw = bytes(elt.info) if elt.info else b''
-                    if raw:
-                        meta['ssid'] = raw.decode('utf-8', errors='replace')
-                    break
-                elt = (elt.payload.getlayer(Dot11Elt)
-                       if elt.payload else None)
+            ssid_seen = False
+            channel = None
+            auth_bits: dict = {}
+            for elt in _iter_elts(pkt, Dot11Elt):
+                eid = getattr(elt, 'ID', None)
+                raw = _safe_info(elt)
+                if eid == 0 and not ssid_seen:
+                    ssid_seen = True
+                    meta['ssid'] = raw.decode('utf-8', errors='replace') if raw else '<hidden>'
+                elif eid == 3 and raw:
+                    channel = raw[0]
+                elif eid == 48:
+                    auth_bits.update(_parse_rsn(raw))
+                elif eid == 221:
+                    auth_bits.update(_parse_wpa_vendor(raw))
+
+            # Scapy's network_stats() often extracts channel/crypto already.
+            try:
+                st = pkt[Dot11Beacon if pkt.haslayer(Dot11Beacon) else Dot11ProbeResp].network_stats()
+                if st.get('channel') and channel is None:
+                    channel = int(st['channel'])
+                crypto = st.get('crypto')
+                if crypto and not auth_bits:
+                    if isinstance(crypto, set):
+                        crypto_s = '+'.join(sorted(map(str, crypto)))
+                    else:
+                        crypto_s = str(crypto)
+                    auth_bits = {'auth_mode': crypto_s, 'encryption': crypto_s}
+            except Exception:
+                pass
+
+            if channel is None and freq_mhz:
+                channel = frequency_to_channel(freq_mhz)
+            if channel is not None:
+                meta['channel'] = int(channel)
+                if not freq_mhz:
+                    mhz = channel_to_frequency_mhz(int(channel))
+                    if mhz:
+                        freq_mhz = float(mhz)
+
+            privacy = _cap_privacy(pkt)
+            meta['privacy'] = bool(privacy)
+            meta.update(auth_bits)
+            if privacy and not meta.get('auth_mode'):
+                meta['auth_mode'] = 'WEP/unknown'
+                meta['encryption'] = 'WEP/unknown'
+            elif not privacy and not meta.get('auth_mode'):
+                meta['auth_mode'] = 'OPEN'
+                meta['encryption'] = 'OPEN'
+
+        if not freq_mhz:
+            # Unknown channel/frequency is not useful for wardrive source keys.
+            return None
 
         return Frame(
             data=bytes(pkt),

@@ -4,7 +4,7 @@ AetherWard (AW) — RF observation framework.
 Hardware-agnostic.  Frequency-agnostic.  Mode-agnostic.
 """
 
-__version__ = '0.2.2'
+__version__ = '0.3.0'
 
 from .position.absolute import AbsolutePosition, FixType
 from .position.relative import RelativePosition, RelSource

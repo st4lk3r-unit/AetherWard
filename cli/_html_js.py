@@ -1,6 +1,6 @@
 _HTML_JS = r"""<script>
 // ── State ─────────────────────────────────────────────────────────────────────
-const srcs = {}, mkrs = {};
+const srcs = {}, mkrs = {}, confs = {};
 let map = null, totalUpd = 0;
 const STEPS = 6;
 let wStep = 1;
@@ -8,7 +8,7 @@ const W = {
   mode:'wardriver', antennas:[{id:'wlan0',preset:'wifi24',freqMin:2400000000,freqMax:2500000000,backend:'plugins.wifi_nl80211.NL80211Backend',x:0,y:0,z:0}],
   gps:'gpsd', lat:0, lon:0, alt:0,
   sync:'software', syncDev:'',
-  output:'~/.aetherward/sessions/session.jsonl',
+  configName:'wardrive', sessionName:'wardrive', sessionNameTouched:false,
   // mode-specific advanced config (mirrors CLI wizard custom)
   channels:'1,2,3,4,5,6,7,8,9,10,11,12,13', hopInterval:0.1,
   triChannel:6, corrWindow:0.001, groupTimeout:0.05,
@@ -31,6 +31,32 @@ const BACKENDS = [
   {id:'plugins.hackrf.HackRFBackend',        l:'HackRF'},
   {id:'null',                                l:'Null / simulated'},
 ];
+
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]||c));}
+function jsq(v){return String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n');}
+function _has(v){return v!==undefined&&v!==null&&v!=='';}
+function _boolTxt(v){return v===true?'yes':v===false?'no':'—';}
+function _fmtNum(v,n=2){const x=Number(v);return Number.isFinite(x)?x.toFixed(n):'—';}
+function _kv(k,v){return `<div class="pos-info-k">${esc(k)}</div><div class="pos-info-v">${_has(v)?esc(v):'—'}</div>`;}
+function ansiToHtml(text){
+  let out='', open=0, i=0;
+  function closeAll(){while(open>0){out+='</span>';open--;}}
+  while(i<text.length){
+    if(text[i]==='\x1b'&&text[i+1]==='['){
+      const m=text.slice(i).match(/^\x1b\[([0-9;]*)m/);
+      if(m){
+        const parts=(m[1]||'0').split(';');
+        if(!parts[0]||parts[0]==='0') closeAll();
+        else if(parts[0]==='38'&&parts[1]==='2'&&parts.length>=5){out+=`<span style="color:rgb(${+parts[2]},${+parts[3]},${+parts[4]})">`;open++;}
+        else if(parts[0]==='30'){out+='<span style="color:transparent">';open++;}
+        i+=m[0].length; continue;
+      }
+    }
+    out+=esc(text[i++]);
+  }
+  closeAll();
+  return out;
+}
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function tab(btn) {
@@ -69,24 +95,37 @@ function _updateMapCenter(){
   if(el) el.textContent=c.lat.toFixed(6)+',  '+c.lng.toFixed(6);
 }
 const _TILE_SOURCES = {
-  'CartoDB Dark':   {url:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',    opts:{subdomains:'abcd',maxZoom:19,attribution:'&copy; <a href="https://openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'}},
-  'CartoDB No Lbl': {url:'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',opts:{subdomains:'abcd',maxZoom:19,attribution:'&copy; <a href="https://openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'}},
-  'Stadia Dark':    {url:'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png',opts:{maxZoom:20,attribution:'&copy; <a href="https://stadiamaps.com">Stadia Maps</a> &copy; <a href="https://openstreetmap.org">OSM</a>'}},
-  'ESRI Dark Gray': {url:'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',opts:{maxZoom:16,attribution:'&copy; <a href="https://esri.com">Esri</a>'}},
+  // Avoid CartoDB here: in the embedded web UI it often renders fully blank on
+  // locked-down browser/LAN setups, while Stadia/ESRI continue to work.
+  'Dark':      {url:'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',opts:{maxZoom:16,attribution:'&copy; <a href="https://esri.com">Esri</a>'}},
+  'No Labels': {url:'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',opts:{maxZoom:16,attribution:'&copy; <a href="https://esri.com">Esri</a>'}},
+  'Stadia':    {url:'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png',opts:{maxZoom:20,attribution:'&copy; <a href="https://stadiamaps.com">Stadia Maps</a> &copy; <a href="https://openstreetmap.org">OSM</a>'}},
+  'ESRI':      {url:'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',opts:{maxZoom:19,attribution:'&copy; <a href="https://esri.com">Esri</a>'}},
 };
+const _TILE_ALIASES = {'CartoDB Dark':'Dark','CartoDB No Lbl':'No Labels','Stadia Dark':'Stadia','ESRI Dark Gray':'ESRI'};
 let _tileLayer = null;
 function _switchTile(name) {
+  name = _TILE_ALIASES[name] || name;
   const src = _TILE_SOURCES[name]; if (!src || !map) return;
   if (_tileLayer) { map.removeLayer(_tileLayer); }
-  _tileLayer = L.tileLayer(src.url, src.opts).addTo(map);
+  let failed = false;
+  _tileLayer = L.tileLayer(src.url, src.opts)
+    .on('tileerror',()=>{
+      if(failed || name==='Stadia') return;
+      failed = true;
+      console.warn('Tile layer failed, falling back to Stadia');
+      _switchTile('Stadia');
+    })
+    .addTo(map);
   localStorage.setItem('aw_tile', name);
   document.querySelectorAll('.tile-btn').forEach(b => b.classList.toggle('tile-btn-active', b.dataset.tile === name));
 }
 function initMap() {
   if (map) return;
   map = L.map('map',{preferCanvas:true}).setView([48.8566,2.3522],13);
-  const saved = localStorage.getItem('aw_tile') || 'CartoDB Dark';
-  _switchTile(Object.keys(_TILE_SOURCES).includes(saved) ? saved : 'CartoDB Dark');
+  const savedRaw = localStorage.getItem('aw_tile') || 'Dark';
+  const saved = _TILE_ALIASES[savedRaw] || savedRaw;
+  _switchTile(Object.keys(_TILE_SOURCES).includes(saved) ? saved : 'Dark');
   map.on('move',_updateMapCenter);
   _updateMapCenter();
   Object.values(srcs).forEach(updateMarker);
@@ -121,7 +160,8 @@ function applyMapFilters(){
   if(!map) return;
   Object.entries(mkrs).forEach(([id,mk])=>{
     const rec=srcs[id]; if(!rec) return;
-    if(_markerVisible(rec)) mk.addTo(map); else mk.remove();
+    if(_markerVisible(rec)){ mk.addTo(map); if(confs[id]) confs[id].addTo(map); }
+    else{ mk.remove(); if(confs[id]) confs[id].remove(); }
   });
   refreshMapCount();
 }
@@ -133,24 +173,44 @@ function setRadiusCenter(){
   if(btn){btn.style.color='var(--acc)';btn.style.borderColor='var(--acc)';}
   applyMapFilters();
 }
+function sourcePopup(rec){
+  const id=esc(rec.id||''), lbl=esc(String(rec.ssid||rec.id||'?').slice(0,36));
+  const res=rec.residual_dBm!=null?`<span style="color:var(--ylw)">Residual:</span> ${_fmtNum(rec.residual_dBm,2)} dB<br>`:
+            rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${_fmtNum(rec.residual_m,2)} m<br>`:'';
+  const conf=rec.confidence_radius_m!=null?`<span style="color:var(--ylw)">Confidence circle:</span> ${_fmtNum(rec.confidence_radius_m,1)} m ${rec.confidence?`(${esc(rec.confidence)})`:''}<br>`:'';
+  const chan=_has(rec.channel)?`<span style="color:var(--mu)">Ch:</span> ${esc(rec.channel)} &nbsp;`:'';
+  const auth=rec.auth_mode?`<span style="color:var(--mu)">Auth:</span> ${esc(rec.auth_mode)}<br>`:'';
+  const sec=[rec.encryption,rec.cipher,rec.akm].filter(_has).map(esc).join(' / ');
+  const secLine=sec?`<span style="color:var(--mu)">Security:</span> ${sec}<br>`:'';
+  const priv=rec.privacy!==undefined?`<span style="color:var(--mu)">Privacy bit:</span> ${_boolTxt(rec.privacy)}<br>`:'';
+  const payload=encodeURIComponent(JSON.stringify(rec));
+  return `<b>${lbl}</b><br><small style="color:var(--mu)">${id}</small><br>
+    <span style="color:var(--mu)">Protocol:</span> ${esc(rec.protocol||'?')}<br>
+    <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${esc(rec.pos_method||'?')}</b><br>
+    ${_fmtNum(rec.lat,6)}, ${_fmtNum(rec.lon,6)}<br>
+    <span style="color:var(--mu)">Samples:</span> ${esc(rec.samples||'?')} &nbsp;
+    ${chan}<span style="color:var(--mu)">Freq:</span> ${esc(rec.freq_mhz||'?')} MHz<br>${auth}${secLine}${priv}${res}${conf}
+    <a href="#" onclick="openPosInfoPayload('${payload}');return false" style="color:var(--acc);font-size:.78rem">Details</a> ·
+    <a href="#" onclick="hideSource('${jsq(rec.id||'')}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
+}
 function updateMarker(rec){
   if(!map||!rec.lat||!rec.lon)return;
-  const id=rec.id, lbl=(rec.ssid||rec.id||'?').slice(0,36);
-  const res=rec.residual_dBm!=null?`<span style="color:var(--ylw)">Residual:</span> ${rec.residual_dBm} dB<br>`:
-            rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${(+rec.residual_m).toFixed(2)} m<br>`:'';
-  const pop=`<b>${lbl}</b><br><small style="color:var(--mu)">${rec.id||''}</small><br>
-    <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${rec.pos_method||'?'}</b><br>
-    ${(+rec.lat).toFixed(6)}, ${(+rec.lon).toFixed(6)}<br>
-    <span style="color:var(--mu)">Samples:</span> ${rec.samples||'?'} &nbsp;
-    <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz<br>${res}
-    <a href="#" onclick="hideSource('${id}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
+  const id=rec.id;
+  const pop=sourcePopup(rec);
+  const color=mkColor(rec.pos_method);
   if(mkrs[id]){mkrs[id].setLatLng([rec.lat,rec.lon]).setIcon(mkIcon(rec.pos_method));mkrs[id].getPopup().setContent(pop);}
   else{mkrs[id]=L.marker([rec.lat,rec.lon],{icon:mkIcon(rec.pos_method)}).addTo(map).bindPopup(pop);map.panTo([rec.lat,rec.lon]);}
-  if(!_markerVisible(rec)) mkrs[id].remove();
+  if(rec.confidence_radius_m!=null&&(+rec.confidence_radius_m)>0){
+    if(confs[id]){confs[id].setLatLng([rec.lat,rec.lon]);confs[id].setRadius(+rec.confidence_radius_m);}
+    else{confs[id]=L.circle([rec.lat,rec.lon],{radius:+rec.confidence_radius_m,color,weight:1,opacity:.45,fillOpacity:.06});}
+    if(_markerVisible(rec)) confs[id].addTo(map);
+  }
+  if(!_markerVisible(rec)){ mkrs[id].remove(); if(confs[id]) confs[id].remove(); }
   refreshMapCount();
 }
 function hideSource(id){
   if(mkrs[id]){mkrs[id].remove();delete mkrs[id];}
+  if(confs[id]){confs[id].remove();delete confs[id];}
   if(map) map.closePopup();
   refreshMapCount();
 }
@@ -163,7 +223,7 @@ function mapFilterLegend(el){
   el.classList.toggle('hidden');
   const m=el.dataset.m, hide=el.classList.contains('hidden');
   Object.entries(mkrs).forEach(([id,mk])=>{
-    if((srcs[id]?.pos_method||'')=== m){ if(hide) mk.remove(); else mk.addTo(map); }
+    if((srcs[id]?.pos_method||'')=== m){ if(hide){ mk.remove(); if(confs[id]) confs[id].remove(); } else { mk.addTo(map); if(confs[id]) confs[id].addTo(map); } }
   });
   refreshMapCount();
 }
@@ -229,9 +289,14 @@ function addPathFromSession(path, name){
         const ts=r.t?new Date(r.t*1000).toISOString().slice(11,19):'?';
         const freq=r.freq?(r.freq/1e6).toFixed(0)+' MHz':'?';
         const coords=`<span style="font-family:monospace;font-size:.7rem;color:var(--mu)">${(+r.lat).toFixed(6)}, ${(+r.lon).toFixed(6)}</span>`;
-        const pop=`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
-          +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
-          +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
+        const auth=r.auth_mode?`<br><span style="color:var(--mu)">Auth:</span> ${esc(r.auth_mode)}`:'';
+      const chan=r.channel?` &nbsp;<span style="color:var(--mu)">Ch:</span> ${esc(r.channel)}`:'';
+      const sec=[r.encryption,r.cipher,r.akm].filter(_has).map(esc).join(' / ');
+      const secLine=sec?`<br><span style="color:var(--mu)">Security:</span> ${sec}`:'';
+      const acc=r.gps_accuracy_h!=null?`<br><span style="color:var(--mu)">GPS ±:</span> ${_fmtNum(r.gps_accuracy_h,1)} m`:'';
+      const pop=`${r.ssid?`<b>${esc(r.ssid)}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${esc(r.id)}</small><br>`:''}`
+          +`<span style="color:var(--ylw)">RSSI:</span> ${esc(r.rssi??'?')} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}${chan}`
+          +`${r.protocol?` <span style="color:var(--mu)">(${esc(r.protocol)})</span>`:''}${auth}${secLine}${acc}`
           +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
         dot.bindPopup(pop,{maxWidth:230,className:'aw-path-tip'});
         if(on) dot.addTo(map);
@@ -306,8 +371,9 @@ function exportMapGeoJSON(){
     type:'Feature',
     geometry:{type:'Point',coordinates:[(+r.lon),(+r.lat),0]},
     properties:{id:r.id||'',ssid:r.ssid||'',pos_method:r.pos_method||'',
-                rssi:r.rssi??null,freq_mhz:r.freq_mhz??null,samples:r.samples??null,
-                residual_m:r.residual_m??null},
+                confidence:r.confidence||'',confidence_radius_m:r.confidence_radius_m??null,
+                rssi:r.rssi??null,freq_mhz:r.freq_mhz??null,channel:r.channel??null,auth_mode:r.auth_mode??'',samples:r.samples??null,
+                residual_m:r.residual_m??null,residual_dBm:r.residual_dBm??null},
   }));
   _dlBlob(JSON.stringify({type:'FeatureCollection',features},null,2),
     'aetherward-positions.geojson','application/json');
@@ -315,7 +381,7 @@ function exportMapGeoJSON(){
 function exportMapCSV(){
   const rows=_visibleSrcs();
   if(!rows.length){alert('No visible sources to export.');return;}
-  const fields=['id','ssid','lat','lon','pos_method','rssi','freq_mhz','samples','residual_m','rssi_at_1m'];
+  const fields=['id','ssid','lat','lon','pos_method','confidence','confidence_radius_m','rssi','freq_mhz','channel','auth_mode','samples','residual_m','residual_dBm','rssi_at_1m'];
   const hdr=fields.join(',');
   const csv=rows.map(r=>fields.map(f=>_csvEsc(r[f]??'')).join(',')).join('\n');
   _dlBlob(hdr+'\n'+csv,'aetherward-positions.csv','text/csv');
@@ -453,22 +519,54 @@ function renderPositions(){
   const tb=document.getElementById('src-tb'); if(!tb)return;
   const rows=Object.values(srcs).sort((a,b)=>(b.samples||0)-(a.samples||0));
   tb.innerHTML=rows.length===0
-    ?'<tr><td colspan="8" style="color:var(--mu);text-align:center;padding:1.25rem">No sources yet — start the solver</td></tr>'
+    ?'<tr><td colspan="10" style="color:var(--mu);text-align:center;padding:1.25rem">No sources yet — start the solver</td></tr>'
     :rows.map(r=>{
-      const lbl=r.ssid?`<b>${r.ssid}</b> <span style="color:var(--mu)">${r.id}</span>`:r.id;
-      const res=r.residual_dBm!=null?r.residual_dBm+' dB':r.residual_m!=null?(+r.residual_m).toFixed(1)+' m':'—';
-      return `<tr>
+      const lbl=r.ssid?`<b>${esc(r.ssid)}</b> <span style="color:var(--mu)">${esc(r.id)}</span>`:esc(r.id);
+      const res=r.residual_dBm!=null?_fmtNum(r.residual_dBm,2)+' dB':r.residual_m!=null?_fmtNum(r.residual_m,1)+' m':'—';
+      const payload=encodeURIComponent(JSON.stringify(r));
+      return `<tr class="pos-row" onclick="openPosInfoPayload('${payload}')" title="Click for source details">
         <td>${lbl}</td>
-        <td><span class="badge ${badgeCls(r.pos_method)}">${r.pos_method||'?'}</span></td>
-        <td>${r.lat!=null?(+r.lat).toFixed(6):'—'}</td>
-        <td>${r.lon!=null?(+r.lon).toFixed(6):'—'}</td>
-        <td>${r.samples||'—'}</td><td>${res}</td><td>${r.freq_mhz||'—'}</td>
+        <td><span class="badge ${badgeCls(r.pos_method)}">${esc(r.pos_method||'?')}</span></td>
+        <td>${r.lat!=null?_fmtNum(r.lat,6):'—'}</td>
+        <td>${r.lon!=null?_fmtNum(r.lon,6):'—'}</td>
+        <td>${esc(r.samples||'—')}</td><td>${res}</td><td>${esc(r.channel||'—')}</td><td>${esc(r.auth_mode||'—')}</td><td>${esc(r.freq_mhz||'—')}</td>
         <td style="white-space:nowrap">
-          <button class="btn btn-edit" onclick="openSrcModal(${JSON.stringify(r).replace(/"/g,'&quot;')})">Edit</button>
-          <button class="btn btn-del"  onclick="delSrc('${r.id.replace(/'/g,"\\'")}')">Del</button>
+          <button class="btn btn-edit" onclick="event.stopPropagation();openSrcModal(${JSON.stringify(r).replace(/"/g,'&quot;')})">Edit</button>
+          <button class="btn btn-del"  onclick="event.stopPropagation();delSrc('${String(r.id||'').replace(/'/g,"\\'")}')">Del</button>
         </td></tr>`;
     }).join('');
 }
+
+let _posInfoRec=null;
+function openPosInfoPayload(payload){
+  try{openPosInfo(JSON.parse(decodeURIComponent(payload)));}
+  catch(e){console.warn('bad position payload',e);}
+}
+function openPosInfo(r){
+  _posInfoRec=r;
+  const title=document.getElementById('pos-info-title');
+  if(title) title.textContent=(r.ssid||r.id||'Source')+' details';
+  const body=document.getElementById('pos-info-body');
+  if(!body)return;
+  const sec=[r.encryption,r.cipher,r.akm].filter(_has).join(' / ');
+  const method=r.pos_method||'?';
+  const residual=r.residual_dBm!=null?`${_fmtNum(r.residual_dBm,2)} dB`:r.residual_m!=null?`${_fmtNum(r.residual_m,2)} m`:'—';
+  body.innerHTML=`<div class="pos-info-grid">
+    ${_kv('Protocol',r.protocol)}${_kv('Source ID',r.id)}${_kv('SSID',r.ssid)}
+    ${_kv('Frame type',r.frame_type)}${_kv('Auth mode',r.auth_mode)}${_kv('Security',sec)}
+    ${_kv('Encryption',r.encryption)}${_kv('Cipher',r.cipher)}${_kv('AKM',r.akm)}${_kv('Privacy bit',_boolTxt(r.privacy))}
+    ${_kv('Channel',r.channel)}${_kv('Frequency',_has(r.freq_mhz)?`${r.freq_mhz} MHz`:'')}
+    ${_kv('Position method',method)}${_kv('Latitude',_fmtNum(r.lat,6))}${_kv('Longitude',_fmtNum(r.lon,6))}
+    ${_kv('Samples',r.samples)}${_kv('Residual',residual)}${_kv('Confidence',r.confidence)}
+    ${_kv('Confidence radius',r.confidence_radius_m!=null?`${_fmtNum(r.confidence_radius_m,1)} m`:'')}
+    ${_kv('Observer span',r.observer_span_m!=null?`${_fmtNum(r.observer_span_m,1)} m`:'')}
+    ${_kv('Mean GPS accuracy',r.gps_accuracy_mean_m!=null?`${_fmtNum(r.gps_accuracy_mean_m,1)} m`:'')}
+    ${_kv('Last update',r.t?new Date(r.t*1000).toISOString():'')}
+  </div>`;
+  document.getElementById('pos-info-modal').classList.add('open');
+}
+function closePosInfo(){document.getElementById('pos-info-modal').classList.remove('open');}
+function posInfoEdit(){if(_posInfoRec){closePosInfo();openSrcModal(_posInfoRec);}}
 
 // ── Source modal ──────────────────────────────────────────────────────────────
 let _srcEdit = null;
@@ -537,7 +635,7 @@ function sysLog(msg){
 }
 function appendSolveLog(text){
   const el=document.getElementById('sl-log'); if(!el)return;
-  el.innerHTML+=`<div class="log-run">${new Date().toISOString().slice(11,19)} ${text}</div>`;
+  el.innerHTML+=`<div class="log-run">${new Date().toISOString().slice(11,19)} ${ansiToHtml(text)}</div>`;
   el.scrollTop=el.scrollHeight;
 }
 
@@ -551,7 +649,7 @@ function startRun(){
 function stopRun(){fetch('/api/run/stop',{method:'POST'}).then(()=>loadStatus());}
 function appendRunLog(text){
   const el=document.getElementById('run-log'); if(!el)return;
-  el.innerHTML+=`<div class="log-run">${text}</div>`;
+  el.innerHTML+=`<div class="log-run">${ansiToHtml(text)}</div>`;
   el.scrollTop=el.scrollHeight;
 }
 
@@ -790,31 +888,30 @@ function loadConfigs(){
       :data.map(c=>`<div class="card">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
             <div>
-              <span style="font-weight:600;color:var(--txt)">${c.name}</span>
+              <span style="font-weight:600;color:var(--txt)">${esc(c.name)}</span>
               <span style="font-size:.77rem;color:var(--mu);margin-left:.7rem">
-                mode: <b style="color:var(--acc)">${c.mode}</b> &nbsp;•&nbsp; ${c.antennas} antenna(s)
+                mode: <b style="color:var(--acc)">${esc(c.mode)}</b> &nbsp;•&nbsp; ${c.antennas} antenna(s)
               </span>
             </div>
             <div style="display:flex;gap:.4rem">
-              <button class="btn btn-edit" onclick="openEditCfg('${esc(c.name)}')">Edit</button>
-              <button class="btn btn-del"  onclick="deleteCfg('${esc(c.name)}')">Delete</button>
+              <button class="btn btn-edit" onclick="openEditCfg('${jsq(c.name)}')">Edit</button>
+              <button class="btn btn-del"  onclick="deleteCfg('${jsq(c.name)}')">Delete</button>
             </div>
           </div></div>`).join('');
     ['sl-config','run-config'].forEach(id=>{
       const sel=document.getElementById(id); if(!sel)return;
       const cur=sel.value;
       sel.innerHTML='<option value="">— none —</option>'+
-        data.map(c=>`<option value="${c.name}"${c.name===cur?' selected':''}>${c.name}</option>`).join('');
+        data.map(c=>`<option value="${esc(c.name)}"${c.name===cur?' selected':''}>${esc(c.name)}</option>`).join('');
     });
     const tdoa3dSel=document.getElementById('tdoa3d-config');
     if(tdoa3dSel){
       const cur=tdoa3dSel.value;
       tdoa3dSel.innerHTML='<option value="">— no config (receivers) —</option>'+
-        data.map(c=>`<option value="${c.name}"${c.name===cur?' selected':''}>${c.name}</option>`).join('');
+        data.map(c=>`<option value="${esc(c.name)}"${c.name===cur?' selected':''}>${esc(c.name)}</option>`).join('');
     }
   });
 }
-function esc(s){return s.replace(/'/g,"\\'").replace(/"/g,'&quot;');}
 
 // ── Config editor ─────────────────────────────────────────────────────────────
 const CFG_TPL=`# AetherWard configuration
@@ -839,7 +936,8 @@ port = 2947
 source = "software"
 
 [output]
-path = "~/.aetherward/sessions/session.jsonl"
+format = "jsonl"
+session_name = "new-session"
 `;
 
 function openNewCfg(){
@@ -883,8 +981,34 @@ function deleteCfg(name){
 }
 
 // ── Wizard ────────────────────────────────────────────────────────────────────
+function wizSlugName(v){
+  return (v||'wardrive').toString().trim().toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g,'-').replace(/^-+|-+$/g,'') || 'wardrive';
+}
+function wizSessionPreviewName(){ return wizSlugName(W.sessionName || W.configName || 'wardrive'); }
+function wizUpdateSessionPreview(){
+  const sn=wizSessionPreviewName();
+  const text=`~/.aetherward/sessions/${sn}-<timestamp>.jsonl`;
+  const p1=document.getElementById('wiz-session-preview'); if(p1) p1.textContent=text;
+  const p2=document.getElementById('wiz-session-preview-top'); if(p2) p2.textContent=text;
+  const inp=document.getElementById('wiz-session-name'); if(inp && inp.value!==W.sessionName) inp.value=W.sessionName;
+}
+function wizConfigNameChanged(v){
+  W.configName=wizSlugName(v);
+  const el=document.getElementById('wiz-name'); if(el && el.value!==W.configName) el.value=W.configName;
+  if(!W.sessionNameTouched){ W.sessionName=W.configName; }
+  wizUpdateSessionPreview();
+}
+function wizSessionNameChanged(v){
+  W.sessionName=wizSlugName(v);
+  W.sessionNameTouched=true;
+  const el=document.getElementById('wiz-session-name'); if(el && el.value!==W.sessionName) el.value=W.sessionName;
+  wizUpdateSessionPreview();
+}
+
 function openWizard(){
   wStep=1; wizRenderProgress(); wizShowStep();
+  wizConfigNameChanged(document.getElementById('wiz-name')?.value || W.configName || 'wardrive');
   document.getElementById('wiz-modal').classList.add('open');
   // if we already have cached detect data, use it immediately
   if(_detCache) _applyDetect(_detCache);
@@ -915,7 +1039,7 @@ function wizShowStep(){
   const isLast=wStep===STEPS;
   document.getElementById('wiz-next').style.display=isLast?'none':'';
   document.getElementById('wiz-save').style.display=isLast?'':'none';
-  if(wStep===5) wizShowAdvanced();
+  if(wStep===5) { wizShowAdvanced(); wizUpdateSessionPreview(); }
   if(isLast) wizGenToml();
 }
 function wizNext(){
@@ -996,10 +1120,10 @@ function wizPreset(i,k){
   document.getElementById('ant-customhi-'+i).style.display=k==='custom'?'flex':'none';
 }
 function wizGenToml(){
-  const name=document.getElementById('wiz-name').value||'my-config';
+  const name=wizSlugName(document.getElementById('wiz-name').value||W.configName||'wardrive');
+  const sessionName=wizSlugName(document.getElementById('wiz-session-name')?.value||W.sessionName||name);
   const gps=document.getElementById('wiz-gps').value;
   const sync=document.getElementById('wiz-sync-dev')?.value||'';
-  const out=document.getElementById('wiz-output').value||'~/.aetherward/sessions/session.jsonl';
   const lines=[
     `# AetherWard configuration — generated by web wizard`,
     `array_id = "${name}"`,
@@ -1049,7 +1173,6 @@ function wizGenToml(){
     const chArr='['+ch.split(',').map(c=>c.trim()).filter(Boolean).join(', ')+']';
     lines.push(`channels = ${chArr}`);
     lines.push(`hop_interval = ${hop}`);
-    lines.push(`output_path = "${out}"`);
   } else if(W.mode==='trilateration'){
     const refId=W.antennas[0]?.id||'wlan0';
     lines.push(`channel = ${triCh}`);
@@ -1067,11 +1190,11 @@ function wizGenToml(){
   lines.push(``);
   lines.push(`[output]`);
   lines.push(`format = "jsonl"`);
-  lines.push(`path = "${out}"`);
+  lines.push(`session_name = "${sessionName}"`);
   document.getElementById('wiz-toml').value=lines.join('\n');
 }
 function wizSave(){
-  const name=document.getElementById('wiz-name').value.trim();
+  const name=wizSlugName(document.getElementById('wiz-name').value);
   const content=document.getElementById('wiz-toml').value;
   const err=document.getElementById('wiz-err'); err.style.display='none';
   if(!name){err.textContent='Enter a config name.';err.style.display='block';return;}

@@ -122,34 +122,63 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
     """
     Group wardrive observations by source ID and estimate transmitter position.
 
-    Uses RSS trilateration (Gauss-Newton) when ≥3 GPS-tagged observations are
-    available.  Falls back to an RSSI-weighted centroid for 1–2 observations.
-    The output lat/lon is the *estimated transmitter position*, not the mean of
-    the observer's GPS track.
+    Reads both v1 nested session records and the legacy flat JSONL records.
+    WiGLE export intentionally uses raw observer points, not solved AP guesses.
     """
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
+    from aetherward.session import observer_point, signal_frequency, signal_meta, signal_rssi, source_id, oldstyle_observation
 
-    # Accumulate per-source stats
     sources: dict = defaultdict(lambda: {
-        'rssi': [], 'obs': [], 'alt': [],
-        'freq': None, 'protocol': None, 'ssid': None, 'count': 0,
+        'rssi': [], 'obs': [], 'alt': [], 'gps_acc': [],
+        'freq': None, 'protocol': None, 'ssid': None, 'channel': None,
+        'auth_mode': None, 'count': 0,
     })
 
     for rec in records:
-        sid = rec.get('id') or f"anon:{rec.get('freq', 0):.0f}"
-        s   = sources[sid]
+        sid = source_id(rec)
+        s = sources[sid]
         s['count'] += 1
-        rssi = rec.get('rssi', -100.0)
+        rssi = signal_rssi(rec)
         s['rssi'].append(rssi)
-        if rec.get('lat') is not None:
-            s['obs'].append((rec['lat'], rec['lon'], rssi))
-            s['alt'].append(rec.get('alt', 0.0))
-        if s['freq']     is None: s['freq']     = rec.get('freq')
-        if s['protocol'] is None: s['protocol'] = rec.get('protocol')
-        if s['ssid']     is None: s['ssid']     = rec.get('ssid')
+        pt = observer_point(rec)
+        if pt is not None:
+            lat, lon, alt, rssi2, acc = pt
+            s['obs'].append((lat, lon, rssi2))
+            s['alt'].append(alt)
+            if acc is not None:
+                s['gps_acc'].append(acc)
+        meta = signal_meta(rec)
+        if s['freq'] is None: s['freq'] = signal_frequency(rec)
+        if s['protocol'] is None: s['protocol'] = meta.get('protocol')
+        if s['ssid'] is None: s['ssid'] = meta.get('ssid')
+        if s['channel'] is None: s['channel'] = meta.get('channel')
+        if s['auth_mode'] is None: s['auth_mode'] = meta.get('auth_mode')
 
-    # Estimate transmitter position per source
+    def _span_m(obs: list[tuple[float, float, float]]) -> float:
+        if len(obs) < 2:
+            return 0.0
+        import math
+        lat0 = sum(o[0] for o in obs) / len(obs)
+        xs = [(o[1] * 111_320.0 * math.cos(math.radians(lat0)), o[0] * 111_320.0) for o in obs]
+        return max(math.hypot(a[0]-b[0], a[1]-b[1]) for a in xs for b in xs)
+
+    def _confidence(method: str, samples: int, residual: float | None,
+                    gps_acc: list[float], span_m: float) -> tuple[float, str]:
+        gps = (sum(gps_acc) / len(gps_acc)) if gps_acc else 25.0
+        if method == 'rss_trilateration':
+            radius = max(gps, 20.0, (residual or 8.0) * 18.0)
+            if samples < 8:
+                radius *= 1.5
+            if span_m < 30:
+                radius *= 1.5
+            label = 'high' if samples >= 12 and (residual or 99) <= 6 and span_m >= 50 else \
+                    'medium' if samples >= 6 and (residual or 99) <= 10 else 'low'
+        else:
+            radius = max(gps, 50.0, span_m / 2.0)
+            label = 'low'
+        return round(radius, 1), label
+
     results = []
     n_trilat = n_centroid = n_no_fix = 0
 
@@ -160,41 +189,52 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             continue
 
         mean_rssi = sum(s['rssi']) / len(s['rssi'])
-        mean_alt  = sum(s['alt'])  / len(s['alt']) if s['alt'] else 0.0
-
-        # Try RSS trilateration first (needs ≥3 GPS observations)
+        mean_alt = sum(s['alt']) / len(s['alt']) if s['alt'] else 0.0
         rss = rss_solve(obs) if len(obs) >= 3 else None
 
         if rss is not None:
             est_lat, est_lon = rss['lat'], rss['lon']
-            pos_method  = 'rss_trilateration'
-            rssi_at_1m  = rss['rssi_at_1m']
-            rss_residual = rss['residual_dBm']
+            pos_method = 'rss_trilateration'
+            rssi_at_1m = rss.get('rssi_at_1m')
+            rss_residual = rss.get('residual_dBm')
             n_trilat += 1
         else:
-            # Fall back: RSSI-weighted centroid
             est_lat, est_lon = rssi_centroid(obs)
-            pos_method  = 'rssi_centroid'
-            rssi_at_1m  = None
+            pos_method = 'rssi_centroid'
+            rssi_at_1m = None
             rss_residual = None
             n_centroid += 1
 
+        span = _span_m(obs)
+        conf_m, conf_label = _confidence(pos_method, len(obs), rss_residual, s['gps_acc'], span)
+        freq = s['freq'] or 0.0
         results.append({
-            'id':           sid,
-            'ssid':         s['ssid'] or '',
-            'protocol':     s['protocol'] or '',
-            'freq_mhz':     round((s['freq'] or 0) / 1e6, 3),
-            'rssi_mean':    round(mean_rssi, 1),
-            'rssi_min':     round(min(s['rssi']), 1),
-            'rssi_max':     round(max(s['rssi']), 1),
-            'samples':      s['count'],
-            'gps_obs':      len(obs),
-            'lat':          est_lat,
-            'lon':          est_lon,
-            'alt':          mean_alt,
-            'pos_method':   pos_method,
-            'rssi_at_1m':   rssi_at_1m,
+            'id': sid,
+            'ssid': s['ssid'] or '',
+            'protocol': s['protocol'] or '',
+            'channel': s['channel'],
+            'auth_mode': s['auth_mode'] or '',
+            'freq_mhz': round(freq / 1e6, 3),
+            'rssi_mean': round(mean_rssi, 1),
+            'rssi_min': round(min(s['rssi']), 1),
+            'rssi_max': round(max(s['rssi']), 1),
+            'samples': s['count'],
+            'gps_obs': len(obs),
+            'estimated_lat': est_lat,
+            'estimated_lon': est_lon,
+            'estimated_alt': mean_alt,
+            # legacy aliases for older map consumers
+            'lat': est_lat,
+            'lon': est_lon,
+            'alt': mean_alt,
+            'pos_method': pos_method,
+            'rssi_at_1m': rssi_at_1m,
             'rss_residual': rss_residual,
+            'residual_dBm': rss_residual,
+            'confidence_radius_m': conf_m,
+            'confidence': conf_label,
+            'observer_span_m': round(span, 1),
+            'gps_accuracy_mean_m': round(sum(s['gps_acc']) / len(s['gps_acc']), 1) if s['gps_acc'] else None,
         })
 
     results.sort(key=lambda r: r['rssi_mean'], reverse=True)
@@ -208,10 +248,10 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
         features = []
         for r in results:
             props = {k: v for k, v in r.items()
-                     if k not in ('lat', 'lon', 'alt') and v is not None}
+                     if k not in ('lat', 'lon', 'alt', 'estimated_lat', 'estimated_lon', 'estimated_alt') and v is not None}
             features.append({
                 'type': 'Feature',
-                'geometry': {'type': 'Point', 'coordinates': [r['lon'], r['lat'], r['alt']]},
+                'geometry': {'type': 'Point', 'coordinates': [r['estimated_lon'], r['estimated_lat'], r['estimated_alt']]},
                 'properties': props,
             })
         doc = {'type': 'FeatureCollection', 'features': features}
@@ -238,9 +278,10 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             lines.append(
                 f'<Placemark><name>{r["id"]}</name>'
                 f'<description>SSID: {r["ssid"]}  RSSI: {r["rssi_mean"]} dBm  '
-                f'Samples: {r["samples"]}  Method: {r["pos_method"]}'
+                f'Samples: {r["samples"]}  Method: {r["pos_method"]}  '
+                f'Confidence: {r["confidence"]} / {r["confidence_radius_m"]} m'
                 f'{residual_str}</description>'
-                f'<Point><coordinates>{r["lon"]},{r["lat"]},{r["alt"]}'
+                f'<Point><coordinates>{r["estimated_lon"]},{r["estimated_lat"]},{r["estimated_alt"]}'
                 f'</coordinates></Point></Placemark>'
             )
         lines += ['</Document></kml>']
@@ -248,27 +289,44 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
         suffix = '.kml'
 
     elif fmt == 'wigle':
+        import csv as _csv
+        import io
+        from datetime import datetime, timezone
+
         def _freq_to_channel(mhz: float) -> int:
-            if 2412 <= mhz <= 2484: return round((mhz - 2412) / 5) + 1
-            if mhz >= 5180:         return round((mhz - 5000) / 5)
+            if 2412 <= mhz <= 2472: return round((mhz - 2412) / 5) + 1
+            if mhz == 2484: return 14
+            if mhz >= 5000: return round((mhz - 5000) / 5)
             return 0
-        hdr = ('WigleWifi-1.4,appRelease=AetherWard,model=,release=,'
-               'device=,display=,board=,brand=,star=,body=\n'
-               'MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,'
-               'CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n')
-        rows = []
-        for r in results:
-            freq_khz = round(r['freq_mhz'] * 1000)
-            ch       = _freq_to_channel(r['freq_mhz'])
-            acc      = round(r['rss_residual'], 1) if r.get('rss_residual') else 0
-            ssid_esc = '"' + r['ssid'].replace('"', '""') + '"' if ',' in r['ssid'] or '"' in r['ssid'] else r['ssid']
-            rows.append(','.join([
-                r['id'], ssid_esc, '', '',
-                str(ch), str(freq_khz), str(round(r['rssi_mean'])),
-                f"{r['lat']:.7f}", f"{r['lon']:.7f}",
-                f"{r['alt']:.1f}", str(acc), 'WIFI',
-            ]))
-        out    = hdr + '\n'.join(rows)
+
+        buf = io.StringIO()
+        buf.write('WigleWifi-1.4,appRelease=AetherWard,model=,release=,device=,display=,board=,brand=,star=,body=\n')
+        fields = ['MAC','SSID','AuthMode','FirstSeen','Channel','Frequency','RSSI',
+                  'CurrentLatitude','CurrentLongitude','AltitudeMeters','AccuracyMeters','Type']
+        w = _csv.DictWriter(buf, fieldnames=fields)
+        w.writeheader()
+        for rec in records:
+            flat = oldstyle_observation(rec)
+            if flat.get('lat') is None or flat.get('lon') is None:
+                continue
+            freq_mhz = (flat.get('freq') or 0) / 1e6
+            ts = flat.get('t') or 0
+            first = datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else ''
+            w.writerow({
+                'MAC': flat.get('id') or '',
+                'SSID': flat.get('ssid') or '',
+                'AuthMode': flat.get('auth_mode') or '',
+                'FirstSeen': first,
+                'Channel': flat.get('channel') or _freq_to_channel(freq_mhz),
+                'Frequency': round(freq_mhz * 1000),
+                'RSSI': round(flat.get('rssi') or -100),
+                'CurrentLatitude': f"{flat['lat']:.7f}",
+                'CurrentLongitude': f"{flat['lon']:.7f}",
+                'AltitudeMeters': f"{flat.get('alt') or 0:.1f}",
+                'AccuracyMeters': f"{flat.get('gps_accuracy_h') or 0:.1f}",
+                'Type': 'WIFI',
+            })
+        out = buf.getvalue()
         suffix = '.wigle.csv'
 
     else:
@@ -280,15 +338,11 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             fh.write(out)
         print(f'  {_ok("✓")} Written to {_path(out_path)}')
     else:
-        # Default: write next to session file
         import pathlib
-        default = pathlib.Path(
-            getattr(sys, '_proc_session', '.')
-        ).with_suffix(suffix)
+        default = pathlib.Path(getattr(sys, '_proc_session', '.')).with_suffix(suffix)
         print(f'  {_ok("✓")} Written to {_path(str(default))}')
         with open(default, 'w') as fh:
             fh.write(out)
-
 
 def _proc_tdoa_replay(records: list, config: str, fmt: str, out_path: str | None) -> None:
     """Replay captured frames through the TDOA solver using saved array config."""
@@ -411,6 +465,31 @@ def _cmd_uninstall() -> None:
     shutil.rmtree(AW_HOME)
     print(f'  {_ok("✓")} Removed.\n')
 
+def _safe_session_name(name: str) -> str:
+    import re
+    name = (name or 'session').strip().replace(' ', '-')
+    name = re.sub(r'[^A-Za-z0-9._-]+', '-', name).strip('.-_')
+    return name or 'session'
+
+
+def _apply_output_config(cfg, config_name: str, mode_name: str, mc: dict) -> dict:
+    """Resolve [output] into mode_config without breaking old configs."""
+    if mode_name != 'wardriver':
+        return mc
+    out = dict(getattr(cfg, 'output', {}) or {})
+    if not mc.get('output_path'):
+        if out.get('path'):
+            mc['output_path'] = out['path']
+        else:
+            stem = _safe_session_name(out.get('session_name') or out.get('name') or Path(str(config_name)).stem)
+            ts = time.strftime('%Y%m%d-%H%M%S')
+            AW_SESSIONS.mkdir(parents=True, exist_ok=True)
+            mc['output_path'] = str(AW_SESSIONS / f'{stem}-{ts}.jsonl')
+    if mc.get('output_path') and not mc.get('session_id'):
+        mc['session_id'] = Path(str(mc['output_path'])).expanduser().stem
+    return mc
+
+
 def _load_backend(backend_str: str, backend_config: dict):
     """Dynamically import, instantiate, and initialise a hardware backend."""
     import importlib
@@ -486,7 +565,7 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
 
     # Inject a frame counter so the status loop can report activity
     _frame_count = [0]
-    mc = dict(cfg.mode_config)
+    mc = _apply_output_config(cfg, config, mode_name, dict(cfg.mode_config))
     _orig_on_obs = mc.get('on_observation')
     def _count_frame(obs):
         _frame_count[0] += 1
@@ -499,6 +578,8 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
     print(f'\n  {_hi("▸")} mode={_val(mode_name)}  '
           f'array={_val(cfg.array_id)}  '
           f'antennas={_val(str(array.n))}')
+    if mc.get('output_path'):
+        print(f'  {_lbl("Session")} {_path(str(Path(str(mc["output_path"])).expanduser()))}')
     print(f'  {_dim("Ctrl-C to stop.")}\n')
 
     stopped = threading.Event()
@@ -689,6 +770,7 @@ def _cmd_solve(args) -> None:
 
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
+    from aetherward.session import observer_point, receiver_id, signal_meta, source_id
 
     # Per-source state
     rss_obs  : dict = defaultdict(list)   # sid → [(lat, lon, rssi)]
@@ -743,21 +825,18 @@ def _cmd_solve(args) -> None:
                     continue
                 new_n += 1
 
-                sid = rec.get('id') or f"anon:{rec.get('freq', 0):.0f}"
+                sid = source_id(rec)
 
                 # RSS accumulation
-                if rec.get('lat') is not None:
-                    rss_obs[sid].append((rec['lat'], rec['lon'],
-                                         rec.get('rssi', -100.0)))
+                pt = observer_point(rec)
+                if pt is not None:
+                    lat, lon, _alt, rssi, _acc = pt
+                    rss_obs[sid].append((lat, lon, rssi))
                 if sid not in rss_meta:
-                    rss_meta[sid] = {
-                        'ssid':     rec.get('ssid') or '',
-                        'freq_mhz': round((rec.get('freq') or 0) / 1e6, 3),
-                        'protocol': rec.get('protocol') or '',
-                    }
+                    rss_meta[sid] = signal_meta(rec)
 
                 # TDOA accumulation
-                if tdoa_solve and rec.get('ant'):
+                if tdoa_solve and receiver_id(rec):
                     bucket = int(rec.get('t', 0.0) / corr_win)
                     tdoa_buf[(sid, bucket)].append(rec)
 
@@ -782,6 +861,13 @@ def _cmd_solve(args) -> None:
                 else:
                     continue
 
+                if 'confidence_radius_m' not in pos_rec:
+                    res = pos_rec.get('residual_dBm') or pos_rec.get('rss_residual') or 8.0
+                    radius = max(25.0, float(res) * 18.0)
+                    if len(obs) < 8:
+                        radius *= 1.5
+                    pos_rec['confidence_radius_m'] = round(radius, 1)
+                    pos_rec['confidence'] = 'medium' if len(obs) >= 8 and float(res) <= 10.0 else 'low'
                 prev = solved.get(sid)
                 if prev is None or _pos_changed(prev, pos_rec):
                     _emit(pos_rec)
@@ -791,18 +877,18 @@ def _cmd_solve(args) -> None:
             # ── TDOA solve ────────────────────────────────────────────────
             if tdoa_solve:
                 ready = [(k, g) for k, g in tdoa_buf.items()
-                         if len({r['ant'] for r in g}) >= 3]
+                         if len({receiver_id(r) for r in g}) >= 3]
                 for key, group in ready:
                     sid = key[0]
-                    ant_ids = {r['ant'] for r in group}
-                    ref = next((r for r in group if r['ant'] == ref_id),
+                    ant_ids = {receiver_id(r) for r in group}
+                    ref = next((r for r in group if receiver_id(r) == ref_id),
                                group[0])
-                    meas = [{'antenna_id': r['ant'],
+                    meas = [{'antenna_id': receiver_id(r),
                              'tdoa':      r['t'] - ref['t'],
                              'rssi':      r.get('rssi', -100.0),
                              'timestamp': r['t']}
                             for r in group]
-                    result = tdoa_solve(array, meas, ref['ant'])
+                    result = tdoa_solve(array, meas, receiver_id(ref))
                     if result and result.get('valid'):
                         pos = (result.get('position_absolute')
                                or result.get('position_relative'))
