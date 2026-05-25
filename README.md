@@ -4,9 +4,8 @@
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-WTFPL-darkred?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-440%20passed-brightgreen?style=flat-square)
+[![Tests](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml/badge.svg)](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml)
 ![Version](https://img.shields.io/badge/version-0.3.1-orange?style=flat-square)
-![Deps](https://img.shields.io/badge/deps-numpy%20only-lightgrey?style=flat-square)
 
 **Hardware-agnostic RF observation framework.**  
 Capture, record, and geolocate RF emitters using consumer wireless hardware.
@@ -34,7 +33,7 @@ Swap a WiFi NIC for an SDR, a LoRa dongle, or a custom driver without touching a
 AetherWard is not on PyPI — install directly from the source tree:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/st4lk3r-unit/AetherWard
 cd AetherWard
 
 # create and activate a virtualenv (recommended)
