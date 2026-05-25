@@ -573,7 +573,7 @@ class TestCustomWizardWardriver:
             cfg = _wiz._wizard_custom(hw)
 
         assert cfg['output']['format'] == 'csv'
-        assert cfg['output']['session_name'] == '/tmp/aw.csv'
+        assert cfg['output']['path'] == '/tmp/aw.csv'
 
     def test_serial_imu_wardriver(self):
         """Wardriver with serial IMU augmentation."""
