@@ -36,7 +36,7 @@ RSS positioning is useful for approximate AP/source placement and ranking. It is
 ## Install
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/st4lk3r-unit/AetherWard
 cd AetherWard
 
 python3 -m venv .venv
