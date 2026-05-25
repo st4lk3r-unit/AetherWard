@@ -106,7 +106,7 @@ def _cmd_process(args) -> None:
           f'{_dim(str(len(records)) + " records")}')
 
     if proc_mode == 'wardrive-map':
-        _proc_wardrive_map(records, out_format, out_path)
+        _proc_wardrive_map(records, out_format, out_path, session_path)
     elif proc_mode == 'tdoa-replay':
         cfg_name = getattr(args, 'config', None)
         if not cfg_name:
@@ -118,36 +118,62 @@ def _cmd_process(args) -> None:
         sys.exit(1)
 
 
-def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
+def _proc_wardrive_map(records: list, fmt: str, out_path: str | None,
+                        session_path: str | None = None) -> None:
     """
     Group wardrive observations by source ID and estimate transmitter position.
 
     Uses RSS trilateration (Gauss-Newton) when ≥3 GPS-tagged observations are
     available.  Falls back to an RSSI-weighted centroid for 1–2 observations.
     The output lat/lon is the *estimated transmitter position*, not the mean of
-    the observer's GPS track.
+    the observer's GPS track.  Source metadata is preserved so AP popups and
+    Wigle export keep security/channel/protocol information.
     """
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
+    from aetherward.session import record_get, record_source_id, source_meta_from_record
 
     # Accumulate per-source stats
     sources: dict = defaultdict(lambda: {
-        'rssi': [], 'obs': [], 'alt': [],
-        'freq': None, 'protocol': None, 'ssid': None, 'count': 0,
+        'rssi': [], 'obs': [], 'alt': [], 'count': 0, 'meta': {}, 'first_seen': None,
     })
 
     for rec in records:
-        sid = rec.get('id') or f"anon:{rec.get('freq', 0):.0f}"
+        sid = record_source_id(rec)
         s   = sources[sid]
         s['count'] += 1
         rssi = rec.get('rssi', -100.0)
         s['rssi'].append(rssi)
-        if rec.get('lat') is not None:
+        if rec.get('lat') is not None and rec.get('lon') is not None:
             s['obs'].append((rec['lat'], rec['lon'], rssi))
             s['alt'].append(rec.get('alt', 0.0))
-        if s['freq']     is None: s['freq']     = rec.get('freq')
-        if s['protocol'] is None: s['protocol'] = rec.get('protocol')
-        if s['ssid']     is None: s['ssid']     = rec.get('ssid')
+        if s['first_seen'] is None and rec.get('t') is not None:
+            s['first_seen'] = rec.get('t')
+
+        meta = source_meta_from_record(rec)
+        if 'freq_mhz' not in meta and rec.get('freq') is not None:
+            try:
+                meta['freq_mhz'] = round(float(rec.get('freq')) / 1e6, 3)
+            except (TypeError, ValueError):
+                pass
+        # Keep the first non-empty value for stable fields, but update lists
+        # with their union so no AP detail disappears during aggregation.
+        for k, v in meta.items():
+            if v in (None, '', [], {}):
+                continue
+            if isinstance(v, list):
+                cur = s['meta'].get(k, [])
+                if not isinstance(cur, list):
+                    cur = [cur]
+                s['meta'][k] = sorted({str(x) for x in cur + v})
+            elif k not in s['meta'] or s['meta'].get(k) in (None, '', [], {}):
+                s['meta'][k] = v
+
+        # Legacy flat fields fallback.
+        for k in ('ssid', 'protocol', 'auth_mode', 'security', 'bssid', 'channel'):
+            v = record_get(rec, k)
+            if v not in (None, '', [], {}) and k not in s['meta']:
+                s['meta'][k] = v
 
     # Estimate transmitter position per source
     results = []
@@ -179,23 +205,45 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             rss_residual = None
             n_centroid += 1
 
-        results.append({
+        meta = dict(s['meta'])
+        freq_mhz = meta.get('freq_mhz')
+        if freq_mhz is None:
+            freq = next((r.get('freq') for r in records if record_source_id(r) == sid and r.get('freq') is not None), 0)
+            try:
+                freq_mhz = round(float(freq) / 1e6, 3)
+            except (TypeError, ValueError):
+                freq_mhz = 0.0
+
+        result = {
             'id':           sid,
-            'ssid':         s['ssid'] or '',
-            'protocol':     s['protocol'] or '',
-            'freq_mhz':     round((s['freq'] or 0) / 1e6, 3),
+            'ssid':         meta.get('ssid', ''),
+            'protocol':     meta.get('protocol', ''),
+            'auth_mode':    meta.get('auth_mode', ''),
+            'security':     meta.get('security', ''),
+            'bssid':        meta.get('bssid', sid),
+            'channel':      meta.get('channel'),
+            'band':         meta.get('band', ''),
+            'freq_mhz':     freq_mhz,
             'rssi_mean':    round(mean_rssi, 1),
             'rssi_min':     round(min(s['rssi']), 1),
             'rssi_max':     round(max(s['rssi']), 1),
+            'rssi':         round(mean_rssi, 1),
             'samples':      s['count'],
             'gps_obs':      len(obs),
             'lat':          est_lat,
             'lon':          est_lon,
             'alt':          mean_alt,
+            'first_seen':   s['first_seen'],
             'pos_method':   pos_method,
             'rssi_at_1m':   rssi_at_1m,
             'rss_residual': rss_residual,
-        })
+        }
+        for k in ('frame_type', 'frame_subtype', 'privacy', 'akm_suites',
+                  'pairwise_ciphers', 'group_cipher', 'vendor_ouis',
+                  'capabilities', 'beacon_interval'):
+            if k in meta:
+                result[k] = meta[k]
+        results.append(result)
 
     results.sort(key=lambda r: r['rssi_mean'], reverse=True)
 
@@ -223,23 +271,30 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
         import csv as _csv
         buf = io.StringIO()
         if results:
-            w = _csv.DictWriter(buf, fieldnames=list(results[0].keys()))
+            fieldnames = sorted({k for r in results for k in r.keys()})
+            preferred = ['id', 'ssid', 'auth_mode', 'security', 'protocol', 'channel',
+                         'freq_mhz', 'rssi_mean', 'samples', 'lat', 'lon', 'alt',
+                         'pos_method']
+            fieldnames = preferred + [f for f in fieldnames if f not in preferred]
+            w = _csv.DictWriter(buf, fieldnames=fieldnames)
             w.writeheader()
             w.writerows(results)
         out = buf.getvalue()
         suffix = '.csv'
 
     elif fmt == 'kml':
+        def _kml_val(v):
+            return '' if v is None else str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         lines = ['<?xml version="1.0" encoding="UTF-8"?>',
                  '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>']
         for r in results:
             residual_str = (f'  Residual: {r["rss_residual"]} dB'
                             if r.get('rss_residual') is not None else '')
             lines.append(
-                f'<Placemark><name>{r["id"]}</name>'
-                f'<description>SSID: {r["ssid"]}  RSSI: {r["rssi_mean"]} dBm  '
-                f'Samples: {r["samples"]}  Method: {r["pos_method"]}'
-                f'{residual_str}</description>'
+                f'<Placemark><name>{_kml_val(r["id"])}</name>'
+                f'<description>SSID: {_kml_val(r["ssid"])}  Auth: {_kml_val(r.get("auth_mode", ""))}  '
+                f'RSSI: {r["rssi_mean"]} dBm  Samples: {r["samples"]}  '
+                f'Method: {r["pos_method"]}{residual_str}</description>'
                 f'<Point><coordinates>{r["lon"]},{r["lat"]},{r["alt"]}'
                 f'</coordinates></Point></Placemark>'
             )
@@ -252,18 +307,24 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             if 2412 <= mhz <= 2484: return round((mhz - 2412) / 5) + 1
             if mhz >= 5180:         return round((mhz - 5000) / 5)
             return 0
+        def _csv(v) -> str:
+            s = '' if v is None else str(v)
+            return '"' + s.replace('"', '""') + '"' if ',' in s or '"' in s else s
         hdr = ('WigleWifi-1.4,appRelease=AetherWard,model=,release=,'
                'device=,display=,board=,brand=,star=,body=\n'
                'MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,'
                'CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n')
         rows = []
         for r in results:
-            freq_khz = round(r['freq_mhz'] * 1000)
-            ch       = _freq_to_channel(r['freq_mhz'])
+            freq_khz = round((r.get('freq_mhz') or 0) * 1000)
+            ch       = r.get('channel') or _freq_to_channel(r.get('freq_mhz') or 0)
             acc      = round(r['rss_residual'], 1) if r.get('rss_residual') else 0
-            ssid_esc = '"' + r['ssid'].replace('"', '""') + '"' if ',' in r['ssid'] or '"' in r['ssid'] else r['ssid']
+            ts       = ''
+            if r.get('first_seen'):
+                import datetime as _dt
+                ts = _dt.datetime.fromtimestamp(r['first_seen']).strftime('%Y-%m-%d %H:%M:%S')
             rows.append(','.join([
-                r['id'], ssid_esc, '', '',
+                _csv(r['id']), _csv(r['ssid']), _csv(r.get('auth_mode') or ''), _csv(ts),
                 str(ch), str(freq_khz), str(round(r['rssi_mean'])),
                 f"{r['lat']:.7f}", f"{r['lon']:.7f}",
                 f"{r['alt']:.1f}", str(acc), 'WIFI',
@@ -280,11 +341,8 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None) -> None:
             fh.write(out)
         print(f'  {_ok("✓")} Written to {_path(out_path)}')
     else:
-        # Default: write next to session file
-        import pathlib
-        default = pathlib.Path(
-            getattr(sys, '_proc_session', '.')
-        ).with_suffix(suffix)
+        # Default: write next to the input session file.
+        default = Path(session_path or 'session.jsonl').with_suffix(suffix)
         print(f'  {_ok("✓")} Written to {_path(str(default))}')
         with open(default, 'w') as fh:
             fh.write(out)
@@ -484,9 +542,13 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
 
     gps_be = _init_gps(cfg, array)
 
-    # Inject a frame counter so the status loop can report activity
+    # Inject a frame counter so the status loop can report activity.
+    # [output].path is normalised by AWConfig, but keep a local fallback so
+    # older config objects still make run sessions write files.
     _frame_count = [0]
     mc = dict(cfg.mode_config)
+    if 'output_path' not in mc and getattr(cfg, 'output', {}).get('path'):
+        mc['output_path'] = cfg.output['path']
     _orig_on_obs = mc.get('on_observation')
     def _count_frame(obs):
         _frame_count[0] += 1
@@ -689,6 +751,7 @@ def _cmd_solve(args) -> None:
 
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
+    from aetherward.session import record_source_id, source_meta_from_record
 
     # Per-source state
     rss_obs  : dict = defaultdict(list)   # sid → [(lat, lon, rssi)]
@@ -743,18 +806,16 @@ def _cmd_solve(args) -> None:
                     continue
                 new_n += 1
 
-                sid = rec.get('id') or f"anon:{rec.get('freq', 0):.0f}"
+                sid = record_source_id(rec)
 
                 # RSS accumulation
                 if rec.get('lat') is not None:
                     rss_obs[sid].append((rec['lat'], rec['lon'],
                                          rec.get('rssi', -100.0)))
                 if sid not in rss_meta:
-                    rss_meta[sid] = {
-                        'ssid':     rec.get('ssid') or '',
-                        'freq_mhz': round((rec.get('freq') or 0) / 1e6, 3),
-                        'protocol': rec.get('protocol') or '',
-                    }
+                    rss_meta[sid] = source_meta_from_record(rec)
+                    rss_meta[sid].setdefault('ssid', '')
+                    rss_meta[sid].setdefault('protocol', '')
 
                 # TDOA accumulation
                 if tdoa_solve and rec.get('ant'):

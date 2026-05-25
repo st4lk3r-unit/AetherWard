@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "aetherward"
-version     = "0.2.2"
+version     = "0.3.1"
 description = "AetherWard (AW) — RF observation framework"
 license     = "WTFPL"
 requires-python = ">=3.11"
@@ -37,3 +37,8 @@ select = ["E", "F", "I"]
 python_version      = "3.11"
 strict              = true
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "showcase: generated/demo session suites; run separately from core CI",
+]

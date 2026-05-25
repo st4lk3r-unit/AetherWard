@@ -37,6 +37,10 @@ import random
 import time
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.showcase
+
 TESTS_DIR   = Path.home() / '.aetherward' / 'sessions' / 'tests'
 DIR_WD      = TESTS_DIR / 'wardriver'
 DIR_TDOA    = TESTS_DIR / 'tdoa'

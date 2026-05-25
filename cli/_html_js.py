@@ -135,15 +135,25 @@ function setRadiusCenter(){
 }
 function updateMarker(rec){
   if(!map||!rec.lat||!rec.lon)return;
-  const id=rec.id, lbl=(rec.ssid||rec.id||'?').slice(0,36);
+  const id=String(rec.id||rec.bssid||'?'), lbl=String(rec.ssid||id||'?').slice(0,36);
   const res=rec.residual_dBm!=null?`<span style="color:var(--ylw)">Residual:</span> ${rec.residual_dBm} dB<br>`:
             rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${(+rec.residual_m).toFixed(2)} m<br>`:'';
-  const pop=`<b>${lbl}</b><br><small style="color:var(--mu)">${rec.id||''}</small><br>
-    <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${rec.pos_method||'?'}</b><br>
+  const sec=rec.auth_mode||rec.security||'';
+  const ch=rec.channel?` &nbsp; <span style="color:var(--mu)">Ch:</span> ${_xmlEsc(rec.channel)}`:'';
+  const bssid=rec.bssid&&rec.bssid!==id?`<span style="color:var(--mu)">BSSID:</span> ${_xmlEsc(rec.bssid)}<br>`:'';
+  const detail=[
+    sec?`<span style="color:var(--mu)">Auth:</span> <b>${_xmlEsc(sec)}</b><br>`:'',
+    rec.protocol?`<span style="color:var(--mu)">Protocol:</span> ${_xmlEsc(rec.protocol)}<br>`:'',
+    rec.frame_subtype?`<span style="color:var(--mu)">Frame:</span> ${_xmlEsc(rec.frame_subtype)}<br>`:'',
+    Array.isArray(rec.akm_suites)&&rec.akm_suites.length?`<span style="color:var(--mu)">AKM:</span> ${_xmlEsc(rec.akm_suites.join(', '))}<br>`:'',
+    Array.isArray(rec.pairwise_ciphers)&&rec.pairwise_ciphers.length?`<span style="color:var(--mu)">Cipher:</span> ${_xmlEsc(rec.pairwise_ciphers.join(', '))}<br>`:'',
+  ].join('');
+  const pop=`<b>${_xmlEsc(lbl)}</b><br><small style="color:var(--mu)">${_xmlEsc(id)}</small><br>${bssid}
+    <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${_xmlEsc(rec.pos_method||'?')}</b><br>
     ${(+rec.lat).toFixed(6)}, ${(+rec.lon).toFixed(6)}<br>
     <span style="color:var(--mu)">Samples:</span> ${rec.samples||'?'} &nbsp;
-    <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz<br>${res}
-    <a href="#" onclick="hideSource('${id}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
+    <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz${ch}<br>${detail}${res}
+    <a href="#" onclick="hideSource('${esc(id)}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
   if(mkrs[id]){mkrs[id].setLatLng([rec.lat,rec.lon]).setIcon(mkIcon(rec.pos_method));mkrs[id].getPopup().setContent(pop);}
   else{mkrs[id]=L.marker([rec.lat,rec.lon],{icon:mkIcon(rec.pos_method)}).addTo(map).bindPopup(pop);map.panTo([rec.lat,rec.lon]);}
   if(!_markerVisible(rec)) mkrs[id].remove();
@@ -292,7 +302,7 @@ function exportMapWigle(){
     const freq=Math.round((r.freq_mhz||0)*1000); // kHz
     const rssi=r.rssi!=null?r.rssi:-65;
     const acc=r.residual_m!=null?(+r.residual_m).toFixed(1):0;
-    return [r.id||'',_csvEsc(r.ssid||''),'',ts,ch,freq,rssi,
+    return [r.id||'',_csvEsc(r.ssid||''),_csvEsc(r.auth_mode||r.security||''),ts,ch,freq,rssi,
             (+r.lat).toFixed(7),(+r.lon).toFixed(7),0,acc,'WIFI'].join(',');
   }).join('\n');
   _dlBlob(hdr+csv,'aetherward-wigle.csv','text/csv');
@@ -305,7 +315,8 @@ function exportMapGeoJSON(){
   const features=rows.map(r=>({
     type:'Feature',
     geometry:{type:'Point',coordinates:[(+r.lon),(+r.lat),0]},
-    properties:{id:r.id||'',ssid:r.ssid||'',pos_method:r.pos_method||'',
+    properties:{id:r.id||'',ssid:r.ssid||'',auth_mode:r.auth_mode||'',security:r.security||'',
+                bssid:r.bssid||'',channel:r.channel??null,pos_method:r.pos_method||'',
                 rssi:r.rssi??null,freq_mhz:r.freq_mhz??null,samples:r.samples??null,
                 residual_m:r.residual_m??null},
   }));
@@ -315,7 +326,7 @@ function exportMapGeoJSON(){
 function exportMapCSV(){
   const rows=_visibleSrcs();
   if(!rows.length){alert('No visible sources to export.');return;}
-  const fields=['id','ssid','lat','lon','pos_method','rssi','freq_mhz','samples','residual_m','rssi_at_1m'];
+  const fields=['id','ssid','auth_mode','security','bssid','channel','lat','lon','pos_method','rssi','freq_mhz','samples','residual_m','rssi_at_1m'];
   const hdr=fields.join(',');
   const csv=rows.map(r=>fields.map(f=>_csvEsc(r[f]??'')).join(',')).join('\n');
   _dlBlob(hdr+'\n'+csv,'aetherward-positions.csv','text/csv');
@@ -325,7 +336,7 @@ function exportMapKML(){
   if(!rows.length){alert('No visible sources to export.');return;}
   const placemarks=rows.map(r=>
     `<Placemark><name>${_xmlEsc(r.id||'')}</name>`+
-    `<description>SSID: ${_xmlEsc(r.ssid||'')}  RSSI: ${r.rssi??'?'} dBm  `+
+    `<description>SSID: ${_xmlEsc(r.ssid||'')}  Auth: ${_xmlEsc(r.auth_mode||r.security||'')}  RSSI: ${r.rssi??'?'} dBm  `+
     `Samples: ${r.samples??'?'}  Method: ${r.pos_method||'?'}</description>`+
     `<Point><coordinates>${(+r.lon).toFixed(7)},${(+r.lat).toFixed(7)},0</coordinates></Point></Placemark>`
   ).join('\n');
@@ -814,7 +825,7 @@ function loadConfigs(){
     }
   });
 }
-function esc(s){return s.replace(/'/g,"\\'").replace(/"/g,'&quot;');}
+function esc(s){s=String(s??'');return s.replace(/'/g,"\\'").replace(/"/g,'&quot;');}
 
 // ── Config editor ─────────────────────────────────────────────────────────────
 const CFG_TPL=`# AetherWard configuration
@@ -838,7 +849,14 @@ port = 2947
 [sync]
 source = "software"
 
+[mode_config]
+channels = [1, 6, 11]
+hop_interval = 0.1
+output_path = "~/.aetherward/sessions/session.jsonl"
+store_raw_frames = true
+
 [output]
+format = "jsonl"
 path = "~/.aetherward/sessions/session.jsonl"
 `;
 
@@ -1050,6 +1068,7 @@ function wizGenToml(){
     lines.push(`channels = ${chArr}`);
     lines.push(`hop_interval = ${hop}`);
     lines.push(`output_path = "${out}"`);
+    lines.push(`store_raw_frames = true`);
   } else if(W.mode==='trilateration'){
     const refId=W.antennas[0]?.id||'wlan0';
     lines.push(`channel = ${triCh}`);

@@ -1,6 +1,7 @@
 """Wizard steps, step runner, and quick/custom paths for the aetherward CLI."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from cli.aetherward import (
@@ -295,7 +296,7 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
     def _step_output(ctx: dict) -> dict:
         _sep('Output')
         out_path = _ask_str(
-            'Save captures to', '/tmp/aw-session.jsonl',
+            'Save captures to', str(Path.home() / '.aetherward' / 'sessions' / 'aw-session.jsonl'),
             hint='.jsonl — one JSON record per frame',
             help_text=(
                 'Output file path',
@@ -303,7 +304,7 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
                 'The file is created on first capture and never truncated,\n'
                 'so you can safely resume interrupted sessions.\n\n'
                 'Open in another terminal while running:\n'
-                '  tail -f /tmp/aw-session.jsonl | jq .'
+                '  tail -f ~/.aetherward/sessions/aw-session.jsonl | jq .'
             ),
         )
         return {'out_path': out_path}
@@ -357,7 +358,8 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
 
     mc: dict = {}
     if mode == 'wardriver':
-        mc = {'channels': list(range(1, 14)), 'hop_interval': 0.1, 'output_path': out}
+        mc = {'channels': list(range(1, 14)), 'hop_interval': 0.1,
+              'output_path': out, 'store_raw_frames': True}
     elif mode == 'trilateration':
         mc = {'channel': 6, 'reference_antenna': antennas[0]['id'],
               'correlation_window': 0.001, 'group_timeout': 0.05}
@@ -597,9 +599,10 @@ def _wizard_custom(hw: dict) -> Optional[dict]:  # noqa: C901
         ))
         output: dict = {'format': out_fmt}
         if out_fmt != 'none':
-            output['path'] = _ask_str('Path', f'/tmp/aw-session.{out_fmt}')
+            output['path'] = _ask_str('Path', str(Path.home() / '.aetherward' / 'sessions' / f'aw-session.{out_fmt}'))
             if mode == 'wardriver':
                 mc['output_path'] = output['path']
+                mc.setdefault('store_raw_frames', True)
         return {'output': output}
 
     runner.add('mode',        _step_mode)

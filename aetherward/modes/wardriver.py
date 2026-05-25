@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
@@ -12,22 +13,56 @@ from ..signal.observation import Observation
 from ..signal.source import SignalProperties, SignalSource
 
 
+def _json_safe(value):
+    """Return a JSON-serialisable copy of backend metadata."""
+    if isinstance(value, bytes):
+        return {'encoding': 'hex', 'data': value.hex()}
+    if isinstance(value, bytearray):
+        return {'encoding': 'hex', 'data': bytes(value).hex()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _wifi_channel_frequency_hz(channel: int) -> Optional[float]:
+    """Best-effort WiFi channel → centre frequency mapping."""
+    try:
+        ch = int(channel)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= ch <= 13:
+        return float((2412 + (ch - 1) * 5) * 1_000_000)
+    if ch == 14:
+        return 2484_000_000.0
+    if 32 <= ch <= 177:
+        return float((5000 + ch * 5) * 1_000_000)
+    if 1 <= ch <= 233:  # 6 GHz PSC/non-PSC channel numbering
+        return float((5950 + ch * 5) * 1_000_000)
+    return None
+
+
 class WardriverMode(ScanMode):
     """
     Mode 1 — Wardriving.
 
     One or more antennas scan RF channels and correlate captures with GPS.
-    Channels are partitioned across antennas: every channel is covered by
-    exactly one antenna — no gaps, no duplicates, remainder distributed.
+    Channels are assigned to antennas that cover the channel frequency.  When
+    no frequency-aware match is possible, the mode falls back to balanced
+    round-robin assignment so every channel still gets covered.
 
     Config keys:
-        channels         list[int]       channels to scan (default: 1-13)
-        hop_interval     float           seconds per channel dwell (default: 0.1)
-        gps_backend      GPSBackend      if set, polls GPS and updates the array
-        gps_interval     float           GPS poll interval, seconds (default: 1.0)
-        output_path      str             write JSONL observations here (optional)
-        on_source        callable        called when a new SignalSource appears
-        on_observation   callable        called for every Observation
+        channels          list[int]       channels to scan (default: 1-13)
+        hop_interval      float           seconds per channel dwell (default: 0.1)
+        gps_backend       GPSBackend      if set, polls GPS and updates the array
+        gps_interval      float           GPS poll interval, seconds (default: 1.0)
+        output_path       str             write JSONL observations here (optional)
+        store_raw_frames  bool            store raw frame bytes as hex (default: True)
+        on_source         callable        called when a new SignalSource appears
+        on_observation    callable        called for every Observation
     """
     name = 'wardriver'
 
@@ -41,6 +76,7 @@ class WardriverMode(ScanMode):
         self._gps_backend                             = config.get('gps_backend')
         self._gps_interval:   float                   = config.get('gps_interval', 1.0)
         self._output_path:    Optional[str]           = config.get('output_path')
+        self._store_raw_frames: bool                  = bool(config.get('store_raw_frames', True))
         self._channel_map:    dict[str, list[int]]    = {}
         self._lock     = threading.Lock()
         self._out_lock = threading.Lock()
@@ -85,18 +121,41 @@ class WardriverMode(ScanMode):
     # ── Channel assignment ───────────────────────────────────────────────
 
     def _assign_channels(self) -> None:
-        ants  = [a for a in self.array.antennas if a.backend is not None]
+        ants = [a for a in self.array.antennas if a.backend is not None]
+        self._channel_map = {a.id: [] for a in ants}
         if not ants:
             return
-        n     = len(ants)
-        chans = self._channels
-        total = len(chans)
-        for i, ant in enumerate(ants):
-            # Integer-range division: all channels covered, remainder
-            # goes to later antennas naturally (no channel is ever skipped).
-            lo = (i * total) // n
-            hi = ((i + 1) * total) // n
-            self._channel_map[ant.id] = chans[lo:hi] if lo < hi else chans
+
+        chans = list(self._channels)
+        if not chans:
+            return
+
+        # Single-channel capture is intentionally broadcast to all receivers;
+        # useful for long dwell or later TDOA-style correlation.
+        if len(chans) == 1:
+            for ant in ants:
+                self._channel_map[ant.id] = list(chans)
+            return
+
+        for ch in chans:
+            freq = _wifi_channel_frequency_hz(ch)
+            if freq is None:
+                eligible = ants
+            else:
+                eligible = []
+                for ant in ants:
+                    covers = getattr(ant, 'covers_frequency', None)
+                    try:
+                        if covers is None or covers(freq):
+                            eligible.append(ant)
+                    except Exception:
+                        eligible.append(ant)
+                if not eligible:
+                    eligible = ants
+
+            # Balanced no-overlap assignment within the eligible antenna set.
+            ant = min(eligible, key=lambda a: (len(self._channel_map.get(a.id, [])), a.id))
+            self._channel_map.setdefault(ant.id, []).append(ch)
 
     def _hop_worker(self, ant) -> None:
         channels = self._channel_map.get(ant.id, [])
@@ -135,7 +194,9 @@ class WardriverMode(ScanMode):
                 props = SignalProperties(
                     frequency=frame.frequency,
                     protocol=frame.metadata.get('protocol'),
-                    identifier=frame.metadata.get('identifier'),
+                    identifier=(frame.metadata.get('identifier') or
+                                frame.metadata.get('bssid') or
+                                frame.metadata.get('addr2')),
                 )
                 self._sources[key] = SignalSource(signal=props)
                 if self._on_source:
@@ -149,7 +210,8 @@ class WardriverMode(ScanMode):
 
     @staticmethod
     def _source_key(frame: Frame) -> str:
-        ident = frame.metadata.get('identifier') or ''
+        ident = (frame.metadata.get('identifier') or frame.metadata.get('bssid') or
+                 frame.metadata.get('addr2') or '')
         if ident:
             return f"{frame.frequency:.0f}:{ident}"
         # Anonymous source: bucket by frequency + 1-second time slot so
@@ -162,30 +224,50 @@ class WardriverMode(ScanMode):
     def _write_obs(self, obs: Observation) -> None:
         if self._out_file is None:
             return
+        frame = obs.frame
         gps = obs.array_absolute
+        meta = _json_safe(dict(frame.metadata or {}))
         rec: dict = {
-            't':    obs.frame.timestamp,
-            'freq': obs.frame.frequency,
-            'bw':   obs.frame.bandwidth,
-            'rssi': obs.rssi,
-            'ant':  obs.antenna_id,
+            't':         frame.timestamp,
+            'freq':      frame.frequency,
+            'bw':        frame.bandwidth,
+            'rssi':      obs.rssi,
+            'ant':       obs.antenna_id,
+            'frame_len': len(frame.data),
+            'metadata':  meta,
         }
-        proto = obs.frame.metadata.get('protocol')
-        ident = obs.frame.metadata.get('identifier')
-        ssid  = obs.frame.metadata.get('ssid')
-        if proto:
-            rec['protocol'] = proto
-        if ident:
-            rec['id'] = ident
-        if ssid:
-            rec['ssid'] = ssid
+        if frame.sample_rate:
+            rec['sample_rate'] = frame.sample_rate
+
+        # Keep common fields at top-level for compact tools and legacy readers,
+        # while preserving the full backend metadata dict above.
+        for out_key, meta_key in (
+            ('protocol', 'protocol'), ('id', 'identifier'), ('bssid', 'bssid'),
+            ('ssid', 'ssid'), ('auth_mode', 'auth_mode'), ('security', 'security'),
+            ('channel', 'channel'), ('band', 'band'), ('frame_type', 'frame_type'),
+            ('frame_subtype', 'frame_subtype'), ('privacy', 'privacy'),
+            ('akm_suites', 'akm_suites'), ('pairwise_ciphers', 'pairwise_ciphers'),
+            ('group_cipher', 'group_cipher'), ('beacon_interval', 'beacon_interval'),
+            ('capabilities', 'capabilities'),
+        ):
+            value = meta.get(meta_key)
+            if value not in (None, '', [], {}):
+                rec[out_key] = value
+        if 'id' not in rec and rec.get('bssid'):
+            rec['id'] = rec['bssid']
+
+        if self._store_raw_frames and frame.data:
+            # Hex is larger than base64 but easier to grep, diff, and replay.
+            rec['raw_frame_hex'] = frame.data.hex()
+            rec['raw_frame_b64'] = base64.b64encode(frame.data).decode('ascii')
+
         if gps is not None and gps.is_valid():
             rec['lat'] = gps.lat
             rec['lon'] = gps.lon
             rec['alt'] = gps.alt
             rec['fix'] = int(gps.fix_type)
         with self._out_lock:
-            self._out_file.write(json.dumps(rec) + '\n')
+            self._out_file.write(json.dumps(rec, separators=(',', ':')) + '\n')
 
     # ── Read access ──────────────────────────────────────────────────────
 

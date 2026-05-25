@@ -105,6 +105,7 @@ def _run_solver(session_path: str, config_name: Optional[str],
                 n_exp: float, min_obs: int) -> None:
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
+    from aetherward.session import record_source_id, source_meta_from_record
 
     array = None; tdoa_solve = None; corr_win = 1e-3; ref_id = ''
     if config_name:
@@ -150,14 +151,14 @@ def _run_solver(session_path: str, config_name: Optional[str],
             except ValueError:
                 continue
             new_recs += 1
-            sid = rec.get('id') or f"anon:{rec.get('freq',0):.0f}"
+            sid = record_source_id(rec)
             if rec.get('lat') is not None:
                 rss_obs[sid].append((rec['lat'], rec['lon'], rec.get('rssi', -100.0)))
                 _geo_recs += 1
             if sid not in rss_meta:
-                rss_meta[sid] = {'ssid': rec.get('ssid') or '',
-                                 'freq_mhz': round((rec.get('freq') or 0)/1e6, 3),
-                                 'protocol': rec.get('protocol') or ''}
+                rss_meta[sid] = source_meta_from_record(rec)
+                rss_meta[sid].setdefault('ssid', '')
+                rss_meta[sid].setdefault('protocol', '')
             if tdoa_solve and rec.get('ant'):
                 bucket = int(rec.get('t', 0.0) / corr_win)
                 tdoa_buf[(sid, bucket)].append(rec)
@@ -511,10 +512,13 @@ class _Handler(BaseHTTPRequestHandler):
                         if raw_all:
                             records.append(r)
                         elif r.get('lat') is not None and r.get('lon') is not None:
-                            records.append({'lat': r['lat'], 'lon': r['lon'],
+                            from aetherward.session import record_source_id, source_meta_from_record
+                            meta = source_meta_from_record(r)
+                            records.append({**meta, 'lat': r['lat'], 'lon': r['lon'],
                                             't': r.get('t', 0), 'rssi': r.get('rssi'),
-                                            'id': r.get('id', ''), 'ssid': r.get('ssid', ''),
-                                            'freq': r.get('freq'), 'protocol': r.get('protocol', '')})
+                                            'id': record_source_id(r),
+                                            'freq': r.get('freq'),
+                                            'protocol': meta.get('protocol', r.get('protocol', ''))})
                     except ValueError:
                         pass
             self._json(records)
@@ -583,6 +587,7 @@ class _Handler(BaseHTTPRequestHandler):
             def _do_batch():
                 from collections import defaultdict
                 from aetherward.position.rss import rss_solve, rssi_centroid
+                from aetherward.session import record_source_id, source_meta_from_record
                 sessions = [s for s in _list_sessions()
                             if s['stype'] in ('wardriver', 'tdoa_raw', 'unknown')]
                 total_solved = 0
@@ -596,15 +601,14 @@ class _Handler(BaseHTTPRequestHandler):
                                 if not raw: continue
                                 try: rec = json.loads(raw)
                                 except ValueError: continue
-                                sid = rec.get('id') or f"anon:{rec.get('freq',0):.0f}"
+                                sid = record_source_id(rec)
                                 if rec.get('lat') is not None:
                                     rss_obs[sid].append(
                                         (rec['lat'], rec['lon'], rec.get('rssi', -100.0)))
                                 if sid not in rss_meta:
-                                    rss_meta[sid] = {
-                                        'ssid': rec.get('ssid') or '',
-                                        'freq_mhz': round((rec.get('freq') or 0) / 1e6, 3),
-                                        'protocol': rec.get('protocol') or ''}
+                                    rss_meta[sid] = source_meta_from_record(rec)
+                                    rss_meta[sid].setdefault('ssid', '')
+                                    rss_meta[sid].setdefault('protocol', '')
                     except Exception:
                         continue
                     for sid, obs in rss_obs.items():

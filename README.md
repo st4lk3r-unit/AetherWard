@@ -4,8 +4,8 @@
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-WTFPL-darkred?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-427%20passed-brightgreen?style=flat-square)
-![Version](https://img.shields.io/badge/version-0.2.2-orange?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-440%20passed-brightgreen?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.3.1-orange?style=flat-square)
 ![Deps](https://img.shields.io/badge/deps-numpy%20only-lightgrey?style=flat-square)
 
 **Hardware-agnostic RF observation framework.**  
@@ -48,6 +48,15 @@ pip install .
 pip install ".[yaml]"   # YAML config support (pyyaml)
 pip install ".[sdr]"    # RTL-SDR backend (pyrtlsdr)
 pip install ".[dev]"    # pytest, mypy, ruff
+```
+
+Core CI excludes generated showcase/session suites by default and also checks Python compilation plus the C core build:
+
+```bash
+python -m compileall -q aetherward cli plugins tests
+python -m pytest tests/ -m "not showcase"
+cmake -S . -B build && cmake --build build
+python -m pytest tests/ -m showcase      # optional: regenerate demo sessions
 ```
 
 Requires **Python 3.11+** and **numpy ≥ 1.24**. Everything else is optional.  
@@ -137,9 +146,14 @@ gain_dbi        = 0.0
 backend = "gpsd"
 
 [mode_config]
-channels     = [1, 6, 11]
-hop_interval = 0.1
-output_path  = "~/.aetherward/sessions/session.jsonl"
+channels         = [1, 6, 11]
+hop_interval     = 0.1
+output_path      = "~/.aetherward/sessions/session.jsonl"
+store_raw_frames = true
+
+[output]
+format = "jsonl"
+path   = "~/.aetherward/sessions/session.jsonl"
 ```
 
 Full annotated examples in [`examples/`](examples/).  
@@ -167,7 +181,9 @@ Append-only JSONL. One record per observation. Open with any editor, stream with
 ```json
 {"t": 1716000000.1, "freq": 2412000000, "bw": 20000000, "rssi": -62.0,
  "ant": "wlan0", "protocol": "802.11", "id": "aa:bb:cc:dd:ee:ff",
- "ssid": "Home", "lat": 48.8566, "lon": 2.3522, "alt": 35.0, "fix": 3}
+ "ssid": "Home", "auth_mode": "[WPA2-PSK-CCMP][ESS]", "channel": 6,
+ "metadata": {"frame_subtype": "beacon"}, "raw_frame_hex": "001122...",
+ "lat": 48.8566, "lon": 2.3522, "alt": 35.0, "fix": 3}
 ```
 
 Full format reference in [docs/session-format.md](docs/session-format.md).

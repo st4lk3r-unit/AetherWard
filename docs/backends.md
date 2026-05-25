@@ -56,12 +56,13 @@ backend_config = {interface = "wlan0", restore = true}
 - Puts interface into monitor mode with `ip link set <iface> down`, `iw dev <iface> set type monitor`, `ip link set <iface> up`
 - Captures with Scapy `AsyncSniffer` (non-blocking background thread)
 - Extracts RSSI and frequency from the radiotap header
-- Parses beacon and probe-response frames for BSSID and SSID
-- Populates `frame.metadata` with `protocol`, `bssid`, `ssid`, `identifier`
+- Parses beacon, probe-response, and probe-request metadata
+- Populates `frame.metadata` with `protocol`, addresses, `bssid`, `ssid`, `identifier`, channel/band, capabilities, `auth_mode`, WPA/WPA2/WPA3 cipher/AKM details, vendor IEs, and frame type/subtype
 
 **Frequency coverage:**
 - 2.4 GHz: channels 1–14 (`2412 + (ch−1)×5` MHz; ch 14 = 2484 MHz)
 - 5 GHz: channels 32–177 (`5000 + ch×5` MHz)
+- 6 GHz: best-effort 802.11ax channel numbering (`5950 + ch×5` MHz)
 
 **Requirements:**
 ```bash

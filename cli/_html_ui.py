@@ -389,7 +389,7 @@ input[type=checkbox]{accent-color:var(--acc)}
       <div class="fg">
         <label>
           Capture session
-          <span class="tip" data-tip="Starts the full aetherward pipeline.\nWardriver mode: channel-hopping scan, writes frames to session JSONL.\nMonitor mode requires the interface to already be in monitor mode\n(or run aetherward with sufficient privileges).">?</span>
+          <span class="tip" data-tip="Starts the full aetherward pipeline.\nWardriver mode: channel-hopping scan, writes raw frames + parsed AP metadata to session JSONL.\nMonitor mode requires the interface to already be in monitor mode\n(or run aetherward with sufficient privileges).">?</span>
         </label>
         <div style="display:flex;gap:.5rem">
           <button class="btn btn-p"  id="run-btn-start" onclick="startRun()">▶ Run</button>
@@ -398,7 +398,7 @@ input[type=checkbox]{accent-color:var(--acc)}
       </div>
     </div>
     <div style="font-size:.75rem;color:var(--mu);line-height:1.4">
-      <b style="color:var(--txt)">Run</b> captures raw frames → session JSONL. &nbsp;
+      <b style="color:var(--txt)">Run</b> captures raw frames + AP metadata → session JSONL. &nbsp;
       <b style="color:var(--txt)">Solve</b> reads that file and computes positions — both tabs can run simultaneously.
     </div>
   </div>
@@ -604,7 +604,7 @@ input[type=checkbox]{accent-color:var(--acc)}
           <label class="wiz-choice sel" id="wc-wardriver" onclick="wizSetMode('wardriver')">
             <input type="radio" name="wiz-mode" value="wardriver" checked>
             <div><div class="wiz-choice-title">Wardriver</div>
-            <div class="wiz-choice-desc">Channel-hopping scan with multiple antennas. Each antenna covers a different channel slice. Writes raw frames to a session JSONL file. Use <b>Solve</b> afterward to compute positions.</div></div>
+            <div class="wiz-choice-desc">Channel-hopping scan with multiple antennas. Channels are assigned by antenna frequency range. Writes raw frames and parsed AP metadata to a session JSONL file. Use <b>Solve</b> afterward to compute positions.</div></div>
           </label>
           <label class="wiz-choice" id="wc-trilateration" onclick="wizSetMode('trilateration')">
             <input type="radio" name="wiz-mode" value="trilateration">

@@ -17,25 +17,39 @@ Written by `wardriver` mode for every captured and correlated frame.
 
 ```json
 {
-  "id":       "aa:bb:cc:dd:ee:ff",
-  "ssid":     "MyNetwork",
-  "rssi":     -62.0,
-  "lat":      48.8566,
-  "lon":       2.3522,
-  "freq":     2412000000,
-  "protocol": "wifi",
-  "t":        1716000000.123
+  "t": 1716000000.123,
+  "freq": 2412000000,
+  "bw": 20000000,
+  "rssi": -62.0,
+  "ant": "wlan0",
+  "frame_len": 168,
+  "protocol": "802.11",
+  "id": "aa:bb:cc:dd:ee:ff",
+  "bssid": "aa:bb:cc:dd:ee:ff",
+  "ssid": "MyNetwork",
+  "auth_mode": "[WPA2-PSK-CCMP][ESS]",
+  "security": "WPA2",
+  "channel": 6,
+  "metadata": {"protocol": "802.11", "frame_subtype": "beacon"},
+  "raw_frame_hex": "001122...",
+  "lat": 48.8566,
+  "lon": 2.3522,
+  "alt": 35.0,
+  "fix": 3
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `id` | Source identifier (BSSID, MAC, device ID) |
+| `id` / `bssid` | Source identifier / AP BSSID when known |
 | `ssid` | Human-readable name (when parseable from frame) |
+| `auth_mode` / `security` | Parsed AP security, WPA/WPA2/WPA3/OPEN/WEP when available |
+| `channel` / `freq` | WiFi channel and centre frequency (Hz) |
+| `metadata` | Full backend metadata dictionary, including parsed 802.11 fields and IEs |
+| `raw_frame_hex` / `raw_frame_b64` | Raw captured frame bytes when `store_raw_frames = true` |
 | `rssi` | RSSI at capture time (dBm) |
 | `lat` / `lon` | Observer GPS position at capture time |
-| `freq` | Centre frequency (Hz) |
-| `protocol` | Protocol string (`wifi`, `bt`, `lora`, etc.) |
+| `protocol` | Protocol string (`802.11`, `bt`, `lora`, etc.) |
 | `t` | Unix timestamp (float seconds) |
 
 ### TDOA / ENU position

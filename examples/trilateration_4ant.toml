@@ -54,4 +54,4 @@ correlation_window = 0.001
 
 [output]
 format = "json"
-path   = "/tmp/aw-tdoa.jsonl"
+path   = "~/.aetherward/sessions/aw-tdoa.jsonl"

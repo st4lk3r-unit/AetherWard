@@ -62,8 +62,15 @@ class AWConfig:
         if 'gps'  in d: cfg.gps  = GPSConfig(**d['gps'])
         if 'imu'  in d: cfg.imu  = IMUConfig(**d['imu'])
         if 'sync' in d: cfg.sync = SyncConfig(**d['sync'])
-        cfg.mode_config = d.get('mode_config', {})
-        cfg.output      = d.get('output', {})
+        cfg.mode_config = dict(d.get('mode_config', {}))
+        cfg.output      = dict(d.get('output', {}))
+
+        # Keep the user-facing [output] table authoritative for saved runs,
+        # while preserving backward compatibility with older configs that put
+        # the path directly under [mode_config].
+        if 'output_path' not in cfg.mode_config and cfg.output.get('path'):
+            cfg.mode_config['output_path'] = cfg.output['path']
+
         return cfg
 
     @classmethod
