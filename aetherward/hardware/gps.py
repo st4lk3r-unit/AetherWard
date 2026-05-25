@@ -54,16 +54,25 @@ class GPSDBackend(GPSBackend):
             )
         s.settimeout(None)  # blocking mode; we control timing via select
         self._sock = s
-        # Drain the VERSION banner gpsd sends on connect
+        # Drain the VERSION banner gpsd sends on connect, but keep any
+        # newline-framed JSON we receive so get_position() can parse it.
         deadline = time.time() + 1.0
         while time.time() < deadline:
             r, _, _ = _sel.select([s], [], [], 0.2)
             if not r:
                 break
             try:
-                s.recv(4096)
+                self._buf += s.recv(4096).decode('utf-8', errors='replace')
             except OSError:
                 break
+
+        # Activate the device and ask gpsd for JSON TPV reports. gpsd POLL
+        # only returns useful data for devices that have been WATCHed first.
+        try:
+            s.sendall(b'?WATCH={"enable":true,"json":true};\n')
+        except OSError:
+            self._sock = None
+            raise
 
     def get_position(self) -> Optional[AbsolutePosition]:
         if self._sock is None:
@@ -99,10 +108,15 @@ class GPSDBackend(GPSBackend):
                     report = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if report.get('class') != 'POLL':
+                if report.get('class') == 'TPV':
+                    tpvs = [report]
+                elif report.get('class') == 'POLL':
+                    # POLL contains a list of TPV objects (one per device)
+                    tpvs = report.get('tpv', [])
+                else:
                     continue
-                # POLL contains a list of TPV objects (one per device)
-                for tpv in report.get('tpv', []):
+
+                for tpv in tpvs:
                     _fix_map = {2: FixType.FIX_2D, 3: FixType.FIX_3D}
                     fix = _fix_map.get(tpv.get('mode', 0))
                     if fix is None:
@@ -123,7 +137,8 @@ class GPSDBackend(GPSBackend):
                         timestamp=ts,
                         fix_type=fix,
                     )
-                return None  # POLL received, no device has a fix yet
+                if report.get('class') == 'POLL':
+                    return None  # POLL received, no device has a fix yet
         return None
 
     def close(self) -> None:
