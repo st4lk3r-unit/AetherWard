@@ -10,6 +10,7 @@ from .base import ScanMode
 from ..signal.frame import Frame
 from ..signal.observation import Observation
 from ..signal.source import SignalProperties, SignalSource
+from ..session import make_observation_record
 
 
 class WardriverMode(ScanMode):
@@ -41,6 +42,7 @@ class WardriverMode(ScanMode):
         self._gps_backend                             = config.get('gps_backend')
         self._gps_interval:   float                   = config.get('gps_interval', 1.0)
         self._output_path:    Optional[str]           = config.get('output_path')
+        self._session_id:     str                     = str(config.get('session_id') or '')
         self._channel_map:    dict[str, list[int]]    = {}
         self._lock     = threading.Lock()
         self._out_lock = threading.Lock()
@@ -85,18 +87,74 @@ class WardriverMode(ScanMode):
     # ── Channel assignment ───────────────────────────────────────────────
 
     def _assign_channels(self) -> None:
-        ants  = [a for a in self.array.antennas if a.backend is not None]
+        ants = [a for a in self.array.antennas if a.backend is not None]
         if not ants:
             return
-        n     = len(ants)
-        chans = self._channels
-        total = len(chans)
-        for i, ant in enumerate(ants):
-            # Integer-range division: all channels covered, remainder
-            # goes to later antennas naturally (no channel is ever skipped).
-            lo = (i * total) // n
-            hi = ((i + 1) * total) // n
-            self._channel_map[ant.id] = chans[lo:hi] if lo < hi else chans
+
+        # Filter channels per antenna/backend frequency range before splitting.
+        # This avoids assigning 2.4 GHz channels to a 5 GHz-only adapter, or
+        # channels outside a backend's declared capabilities.
+        eligible: dict[str, list[int]] = {a.id: self._eligible_channels(a) for a in ants}
+        for ant in ants:
+            if not eligible[ant.id]:
+                self._channel_map[ant.id] = []
+
+        for ch in self._channels:
+            candidates = [a for a in ants if ch in eligible.get(a.id, [])]
+            if not candidates:
+                continue
+            # Assign to the currently least-loaded eligible antenna.
+            ant = min(candidates, key=lambda a: len(self._channel_map.get(a.id, [])))
+            self._channel_map.setdefault(ant.id, []).append(ch)
+
+        # Edge case: more antennas than eligible channels.  Keep all antennas
+        # active by letting empty antennas scan their eligible set, matching the
+        # historical "single channel shared by all" behaviour.
+        for ant in ants:
+            if not self._channel_map.get(ant.id) and eligible.get(ant.id):
+                self._channel_map[ant.id] = list(eligible[ant.id])
+
+    @staticmethod
+    def _wifi_channel_frequency_hz(channel: int) -> Optional[float]:
+        if 1 <= channel <= 13:
+            return float((2412 + (channel - 1) * 5) * 1_000_000)
+        if channel == 14:
+            return 2484e6
+        if 32 <= channel <= 177:
+            return float((5000 + channel * 5) * 1_000_000)
+        return None
+
+    def _eligible_channels(self, ant) -> list[int]:
+        out: list[int] = []
+        try:
+            import numbers
+            caps = ant.backend.capabilities() if ant.backend else None
+            fmin_raw = getattr(caps, 'frequency_min')
+            fmax_raw = getattr(caps, 'frequency_max')
+            hop_raw = getattr(caps, 'supports_channel_hop')
+            if not isinstance(fmin_raw, numbers.Real) or not isinstance(fmax_raw, numbers.Real):
+                raise TypeError
+            if not isinstance(hop_raw, bool):
+                raise TypeError
+            fmin = float(fmin_raw)
+            fmax = float(fmax_raw)
+            hop = hop_raw
+        except Exception:
+            caps = None
+            fmin, fmax, hop = float('-inf'), float('inf'), True
+        for ch in self._channels:
+            hz = self._wifi_channel_frequency_hz(int(ch))
+            if hz is None:
+                continue
+            if not ant.covers_frequency(hz):
+                continue
+            if caps is not None:
+                if hz < fmin or hz > fmax:
+                    continue
+                if not hop:
+                    continue
+            out.append(int(ch))
+        return out
 
     def _hop_worker(self, ant) -> None:
         channels = self._channel_map.get(ant.id, [])
@@ -162,28 +220,13 @@ class WardriverMode(ScanMode):
     def _write_obs(self, obs: Observation) -> None:
         if self._out_file is None:
             return
-        gps = obs.array_absolute
-        rec: dict = {
-            't':    obs.frame.timestamp,
-            'freq': obs.frame.frequency,
-            'bw':   obs.frame.bandwidth,
-            'rssi': obs.rssi,
-            'ant':  obs.antenna_id,
-        }
-        proto = obs.frame.metadata.get('protocol')
-        ident = obs.frame.metadata.get('identifier')
-        ssid  = obs.frame.metadata.get('ssid')
-        if proto:
-            rec['protocol'] = proto
-        if ident:
-            rec['id'] = ident
-        if ssid:
-            rec['ssid'] = ssid
-        if gps is not None and gps.is_valid():
-            rec['lat'] = gps.lat
-            rec['lon'] = gps.lon
-            rec['alt'] = gps.alt
-            rec['fix'] = int(gps.fix_type)
+        rec = make_observation_record(
+            frame=obs.frame,
+            antenna_id=obs.antenna_id,
+            gps=obs.array_absolute,
+            session_id=self._session_id,
+            mode=self.name,
+        )
         with self._out_lock:
             self._out_file.write(json.dumps(rec) + '\n')
 

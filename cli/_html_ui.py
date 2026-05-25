@@ -87,7 +87,7 @@ textarea{resize:vertical}
 .btn-edit{background:transparent;color:var(--mu);border:1px solid var(--bdr);font-size:.73rem;padding:.22rem .55rem}.btn-edit:hover{background:var(--bg3);color:var(--txt)}
 button:disabled{opacity:.35;cursor:default}
 
-.log-upd{color:var(--grn)}.log-sys{color:var(--mu)}.log-run{color:var(--blu)}
+.log-upd{color:var(--grn)}.log-sys{color:#9a6f6f}.log-run{color:var(--red2);white-space:pre;font-variant-ligatures:none}
 
 .map-overlay{position:absolute;top:.65rem;right:.65rem;z-index:1000}
 .legend{background:rgba(14,13,20,.94);border:1px solid var(--bdr);border-radius:6px;padding:.65rem;font-size:.74rem;backdrop-filter:blur(6px)}
@@ -109,6 +109,7 @@ button:disabled{opacity:.35;cursor:default}
 /* tooltips */
 .tip{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;background:var(--bg3);border:1px solid var(--bdr);color:var(--mu);font-size:.62rem;cursor:help;margin-left:.3rem;flex-shrink:0;vertical-align:middle}
 .tip-popup{position:fixed;z-index:99999;background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);font-size:.74rem;padding:.45rem .65rem;border-radius:6px;white-space:pre-wrap;max-width:280px;pointer-events:none;line-height:1.45;box-shadow:0 8px 28px rgba(0,0,0,.7)}
+.pos-info-grid{display:grid;grid-template-columns:140px 1fr;gap:.35rem .8rem;font-size:.82rem;line-height:1.45}.pos-info-k{color:var(--mu)}.pos-info-v{color:var(--txt);overflow-wrap:anywhere}.pos-row{cursor:pointer}.pos-row:hover td{background:var(--accDm)!important}
 
 /* page header row */
 .page-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:.85rem;flex-wrap:wrap;gap:.5rem}
@@ -167,7 +168,7 @@ button:disabled{opacity:.35;cursor:default}
 /* checkbox accent colour */
 input[type=checkbox]{accent-color:var(--acc)}
 /* log panel: allow flex override */
-.log{background:var(--bg);border:1px solid var(--bdr);border-radius:6px;padding:.6rem;font-family:monospace;font-size:.77rem;overflow-y:auto;color:var(--mu);min-height:120px}
+.log{background:#100708;border:1px solid #3a1212;border-radius:6px;padding:.6rem;font-family:'Cascadia Code','Fira Mono','Courier New',monospace;font-size:.77rem;overflow:auto;color:#b88a8a;min-height:120px;box-shadow:inset 0 0 22px rgba(255,60,60,.045);white-space:pre;font-variant-ligatures:none}
 </style>
 </head>
 <body>
@@ -242,10 +243,10 @@ input[type=checkbox]{accent-color:var(--acc)}
   <div id="map-wrap">
     <div id="map"></div>
     <div id="tile-switcher">
-      <button class="tile-btn" data-tile="CartoDB Dark"   onclick="_switchTile('CartoDB Dark')">Dark</button>
-      <button class="tile-btn" data-tile="CartoDB No Lbl" onclick="_switchTile('CartoDB No Lbl')">No Labels</button>
-      <button class="tile-btn" data-tile="Stadia Dark"    onclick="_switchTile('Stadia Dark')">Stadia</button>
-      <button class="tile-btn" data-tile="ESRI Dark Gray" onclick="_switchTile('ESRI Dark Gray')">ESRI</button>
+      <button class="tile-btn" data-tile="Dark"      onclick="_switchTile('Dark')">Dark</button>
+      <button class="tile-btn" data-tile="No Labels" onclick="_switchTile('No Labels')">No Labels</button>
+      <button class="tile-btn" data-tile="Stadia"    onclick="_switchTile('Stadia')">Stadia</button>
+      <button class="tile-btn" data-tile="ESRI"      onclick="_switchTile('ESRI')">ESRI</button>
     </div>
     <div class="map-overlay">
       <div class="legend">
@@ -371,7 +372,7 @@ input[type=checkbox]{accent-color:var(--acc)}
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       <table>
-        <thead><tr><th>ID / SSID</th><th>Method</th><th>Lat</th><th>Lon</th><th>Samples</th><th>Residual</th><th>Freq</th><th></th></tr></thead>
+        <thead><tr><th>ID / SSID</th><th>Method</th><th>Lat</th><th>Lon</th><th>Samples</th><th>Residual</th><th>Ch</th><th>Auth</th><th>Freq</th><th></th></tr></thead>
         <tbody id="src-tb"></tbody>
       </table>
     </div>
@@ -535,6 +536,21 @@ input[type=checkbox]{accent-color:var(--acc)}
   </div>
 </div>
 
+<!-- ── Positioned source info modal ── -->
+<div class="modal" id="pos-info-modal">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <span class="modal-hdr-title" id="pos-info-title">Source details</span>
+      <button onclick="closePosInfo()">✕</button>
+    </div>
+    <div class="modal-body" id="pos-info-body"></div>
+    <div class="modal-ftr">
+      <button class="btn btn-s" onclick="posInfoEdit()">Edit / pin</button>
+      <button class="btn btn-p" onclick="closePosInfo()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Source add/edit modal ── -->
 <div class="modal" id="src-modal">
   <div class="modal-box sm">
@@ -597,9 +613,14 @@ input[type=checkbox]{accent-color:var(--acc)}
       <!-- progress dots -->
       <div class="wiz-progress" id="wiz-prog"></div>
 
-      <!-- Step 1: Mode -->
+      <!-- Step 1: Config name + mode -->
       <div class="wiz-step active" id="wiz-s1">
-        <div class="wiz-step-title">Select operating mode</div>
+        <div class="wiz-step-title">Config name &amp; operating mode</div>
+        <div class="fg" style="margin-bottom:.75rem">
+          <label>Config name <span class="tip" data-tip="Saved as ~/.aetherward/configs/&lt;name&gt;.toml.\nThe default session name follows this value and the runner appends a timestamp at capture start.">?</span></label>
+          <input id="wiz-name" value="wardrive" placeholder="wardrive" style="font-family:monospace" oninput="wizConfigNameChanged(this.value)">
+          <div style="font-size:.72rem;color:var(--mu);margin-top:.25rem">Default output: <code id="wiz-session-preview-top">~/.aetherward/sessions/wardrive-&lt;timestamp&gt;.jsonl</code></div>
+        </div>
         <div class="wiz-choices">
           <label class="wiz-choice sel" id="wc-wardriver" onclick="wizSetMode('wardriver')">
             <input type="radio" name="wiz-mode" value="wardriver" checked>
@@ -703,8 +724,9 @@ input[type=checkbox]{accent-color:var(--acc)}
             </div>
           </div>
           <div class="fg" style="margin-top:.7rem">
-            <label>Session file path <span class="tip" data-tip="Where captured frames are written.\nDirectories are created automatically.\nUse ~ for home directory.">?</span></label>
-            <input id="wiz-output" value="~/.aetherward/sessions/session.jsonl" style="font-family:monospace" oninput="W.output=this.value">
+            <label>Session name <span class="tip" data-tip="Do not include a path or extension.\nAt run time AetherWard writes ~/.aetherward/sessions/&lt;session_name&gt;-&lt;timestamp&gt;.jsonl.\nLeave it equal to the config name for clean defaults.">?</span></label>
+            <input id="wiz-session-name" value="wardrive" placeholder="wardrive" style="font-family:monospace" oninput="wizSessionNameChanged(this.value)">
+            <div style="font-size:.72rem;color:var(--mu);margin-top:.25rem">Will write: <code id="wiz-session-preview">~/.aetherward/sessions/wardrive-&lt;timestamp&gt;.jsonl</code></div>
           </div>
         </div>
 
@@ -762,10 +784,6 @@ input[type=checkbox]{accent-color:var(--acc)}
       <!-- Step 6: Review -->
       <div class="wiz-step" id="wiz-s6">
         <div class="wiz-step-title">Review &amp; save</div>
-        <div class="fg" style="margin-bottom:.75rem">
-          <label>Config name</label>
-          <input id="wiz-name" placeholder="my-config" style="font-family:monospace">
-        </div>
         <div class="fg">
           <label>Generated TOML <span class="tip" data-tip="You can edit this before saving.\nThe file will be written to ~/.aetherward/configs/<name>.toml">?</span></label>
           <textarea id="wiz-toml" rows="16" style="font-family:'Cascadia Code','Fira Mono',monospace;font-size:.79rem"></textarea>

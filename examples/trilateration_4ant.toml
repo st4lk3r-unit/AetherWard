@@ -53,5 +53,5 @@ reference_antenna  = "ant-ref"
 correlation_window = 0.001
 
 [output]
-format = "json"
-path   = "/tmp/aw-tdoa.jsonl"
+format = "jsonl"
+session_name = "tdoa-array"
