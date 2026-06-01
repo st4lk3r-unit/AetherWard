@@ -1,11 +1,11 @@
 <div align="center">
 
-<img src="docs/banner.png" alt="AetherWard" width="720">
+<img src="img/banner.png" alt="AetherWard" width="720">
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-WTFPL-darkred?style=flat-square)
 [![Tests](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml/badge.svg)](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml)
-![Version](https://img.shields.io/badge/version-0.3.1-orange?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.3.2-orange?style=flat-square)
 
 **Hardware-agnostic RF observation framework.**  
 Capture, record, and geolocate RF emitters using consumer wireless hardware.
@@ -147,12 +147,14 @@ backend = "gpsd"
 [mode_config]
 channels         = [1, 6, 11]
 hop_interval     = 0.1
-output_path      = "~/.aetherward/sessions/session.jsonl"
+# Optional: omit output_path to use the default sessions folder
+# (~/.aetherward/sessions/<array_id>-YYYYmmdd-HHMMSS.jsonl).
 store_raw_frames = true
 
 [output]
 format = "jsonl"
-path   = "~/.aetherward/sessions/session.jsonl"
+# Use the default sessions folder instead of one fixed path.
+path_policy = "default"
 ```
 
 Full annotated examples in [`examples/`](examples/).  

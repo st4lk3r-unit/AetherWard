@@ -41,7 +41,7 @@ Linux 802.11 monitor-mode capture via Scapy and `iw`/`ip`.
 ```toml
 [[antennas]]
 backend        = "plugins.wifi_nl80211.NL80211Backend"
-backend_config = {interface = "wlan0", restore = true}
+backend_config = {interface = "wlan0", restore = true, auto_recover = true}
 ```
 
 **Config keys:**
@@ -51,9 +51,12 @@ backend_config = {interface = "wlan0", restore = true}
 | `interface` | `wlan0` | Wireless interface |
 | `restore` | `true` | Restore managed mode on close |
 | `antenna_id` | interface name | Override the antenna ID string |
+| `auto_recover` | `true` | On channel-set failure, reset the interface back through down → monitor → up and restart capture |
+| `recover_cooldown` | `2.0` | Minimum seconds between automatic interface resets, to avoid reset storms when dwell is very low |
 
 **Behaviour:**
 - Puts interface into monitor mode with `ip link set <iface> down`, `iw dev <iface> set type monitor`, `ip link set <iface> up`
+- If `iw dev <iface> set channel <ch>` fails during hopping, automatically stops the sniffer, resets the interface down → monitor → up, restarts the sniffer, and retries the channel once
 - Captures with Scapy `AsyncSniffer` (non-blocking background thread)
 - Extracts RSSI and frequency from the radiotap header
 - Parses beacon, probe-response, and probe-request metadata

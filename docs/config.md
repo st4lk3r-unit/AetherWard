@@ -63,12 +63,14 @@ device = ""                     # e.g. /dev/pps0
 # wardriver
 channels         = [1, 6, 11]
 hop_interval     = 0.1
-output_path      = "~/.aetherward/sessions/session.jsonl"
+# Optional: omit output_path to use the default sessions folder
+# (~/.aetherward/sessions/<array_id>-YYYYmmdd-HHMMSS.jsonl).
 store_raw_frames = true
 
 [output]
 format = "jsonl"
-path   = "~/.aetherward/sessions/session.jsonl"
+# Use the default sessions folder instead of one fixed path.
+path_policy = "default"
 
 # trilateration (replace mode_config block)
 # channel            = 6
@@ -84,9 +86,6 @@ path   = "~/.aetherward/sessions/session.jsonl"
 # hysteresis         = 0.4
 # ema_alpha          = 0.3
 
-[output]
-format = "jsonl"
-path   = "~/.aetherward/sessions/session.jsonl"
 ```
 
 ---
@@ -155,7 +154,7 @@ Serial IMU expects JSON lines:
 |-----|------|---------|-------------|
 | `channels` | list[int] | 1–13 | Channels to scan |
 | `hop_interval` | float | `0.1` | Seconds per channel |
-| `output_path` | string | — | JSONL output path. If omitted, `[output].path` is used. |
+| `output_path` | string | `~/.aetherward/sessions/<array_id>-YYYYmmdd-HHMMSS.jsonl` | JSONL output path. If omitted, `[output].path` is used; if both are omitted, a timestamped file is created in the default sessions folder. |
 | `store_raw_frames` | bool | `true` | Store raw frame bytes as `raw_frame_hex`/`raw_frame_b64` |
 
 ### `[mode_config]` — trilateration

@@ -1,6 +1,45 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+import re
+
+
+_DEFAULT_SESSION_BASE = Path.home() / '.aetherward' / 'sessions'
+
+
+def default_session_dir() -> Path:
+    """Return AetherWard's default directory for recorded session files."""
+    return _DEFAULT_SESSION_BASE
+
+
+def _safe_session_stem(value: object | None, fallback: str = 'session') -> str:
+    if isinstance(value, str):
+        stem = value.strip() or fallback
+    else:
+        stem = fallback
+    stem = re.sub(r'[^A-Za-z0-9_.-]+', '-', stem).strip('.-')
+    return stem or fallback
+
+
+def default_session_path(array_id: str | None = None,
+                         mode: str | None = None,
+                         suffix: str = '.jsonl',
+                         now: datetime | None = None,
+                         base_dir: str | Path | None = None) -> str:
+    """
+    Build a per-run session filename under ~/.aetherward/sessions.
+
+    The path is intentionally timestamped so repeated `aetherward run NAME`
+    calls do not silently append unrelated captures to the same file.
+    """
+    base = Path(base_dir).expanduser() if base_dir is not None else default_session_dir()
+    if not suffix.startswith('.'):
+        suffix = '.' + suffix
+    stamp = (now or datetime.now()).strftime('%Y%m%d-%H%M%S')
+    stem = _safe_session_stem(array_id, _safe_session_stem(mode, 'session'))
+    return str(base / f'{stem}-{stamp}{suffix}')
 
 
 def record_metadata(rec: dict) -> dict:

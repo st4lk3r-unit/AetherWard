@@ -378,6 +378,19 @@ class TestQuickWizardWardriver:
             assert key in cfg, f"missing key: {key}"
         assert cfg['array_id'] == 'default'
 
+    def test_default_session_path_policy(self):
+        hw = _hw(n_wifi=1, gpsd=False)
+        with _mock_io(
+            choices  = ['wardriver', 'wlan0', 'dipole_stick', '2.4ghz', 'none', 'none'],
+            ints     = [1],
+            strings  = ['default'],
+        ):
+            cfg = _wiz._wizard_quick(hw)
+
+        assert cfg['output']['format'] == 'jsonl'
+        assert cfg['output']['path_policy'] == 'default'
+        assert 'output_path' not in cfg['mode_config']
+
 
 class TestQuickWizardTrilateration:
     """Quick wizard — trilateration mode."""

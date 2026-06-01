@@ -21,7 +21,7 @@ Scans one or more antennas across RF channels. Every captured frame is tagged wi
 |-----|------|---------|-------------|
 | `channels` | `list[int]` | 1–13 | Channels to scan |
 | `hop_interval` | `float` | `0.1` | Seconds per channel dwell |
-| `output_path` | `string` | — | JSONL session output path; falls back to `[output].path` |
+| `output_path` | `string` | timestamped file in `~/.aetherward/sessions/` | JSONL session output path; falls back to `[output].path`, then to the default sessions folder |
 | `store_raw_frames` | `bool` | `true` | Store raw frame bytes as `raw_frame_hex`/`raw_frame_b64` |
 
 ### RSS solver

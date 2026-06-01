@@ -15,6 +15,7 @@ Requires:
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from typing import Callable, Optional
 
@@ -41,6 +42,12 @@ def _build_tables() -> tuple[dict[int, int], dict[int, int]]:
 
 
 _CHAN_TO_FREQ, _FREQ_TO_CHAN = _build_tables()
+
+
+def _bool_config(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ('0', 'false', 'no', 'off', 'disabled')
+    return bool(value)
 
 
 # ── 802.11 parsing helpers ───────────────────────────────────────────────────
@@ -238,8 +245,10 @@ class NL80211Backend(HardwareBackend):
     and security metadata.
 
     Config keys:
-        interface   str   wireless interface name (e.g. 'wlan0')
-        restore     bool  restore managed mode on close (default True)
+        interface        str    wireless interface name (e.g. 'wlan0')
+        restore          bool   restore managed mode on close (default True)
+        auto_recover     bool   reset interface on channel-set failure (default True)
+        recover_cooldown float  min seconds between resets (default 2.0)
     """
 
     def __init__(self, interface: str = 'wlan0', restore: bool = True) -> None:
@@ -248,6 +257,12 @@ class NL80211Backend(HardwareBackend):
         self._ant_id  = interface
         self._sniffer = None
         self._callback: Optional[Callable[[Frame], None]] = None
+        self._capture_running = False
+        self._auto_recover = True
+        self._recover_cooldown = 2.0
+        self._last_recover = 0.0
+        self._last_channel: Optional[int] = None
+        self._lock = threading.RLock()
 
     # ── HardwareBackend interface ─────────────────────────────────────────────
 
@@ -262,8 +277,10 @@ class NL80211Backend(HardwareBackend):
 
     def configure(self, config: dict) -> None:
         self._iface   = config.get('interface', self._iface)
-        self._restore = config.get('restore', self._restore)
+        self._restore = _bool_config(config.get('restore', self._restore))
         self._ant_id  = config.get('antenna_id', self._iface)
+        self._auto_recover = _bool_config(config.get('auto_recover', self._auto_recover))
+        self._recover_cooldown = float(config.get('recover_cooldown', self._recover_cooldown))
 
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
@@ -278,22 +295,15 @@ class NL80211Backend(HardwareBackend):
         )
 
     def start_capture(self, callback: Callable[[Frame], None]) -> None:
-        from scapy.all import AsyncSniffer
-        self._callback = callback
-        self._sniffer = AsyncSniffer(
-            iface=self._iface,
-            prn=self._handle_packet,
-            store=False,
-        )
-        self._sniffer.start()
+        with self._lock:
+            self._callback = callback
+            self._capture_running = True
+            self._restart_sniffer_locked()
 
     def stop_capture(self) -> None:
-        if self._sniffer is not None:
-            try:
-                self._sniffer.stop()
-            except Exception:
-                pass
-            self._sniffer = None
+        with self._lock:
+            self._capture_running = False
+            self._stop_sniffer_locked()
 
     def set_frequency(self, hz: float) -> None:
         mhz  = round(hz / 1e6)
@@ -306,42 +316,102 @@ class NL80211Backend(HardwareBackend):
 
     def set_channel(self, channel: int) -> None:
         try:
-            subprocess.run(
-                ['iw', 'dev', self._iface, 'set', 'channel', str(channel)],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass
+            channel = int(channel)
+        except (TypeError, ValueError):
+            return
+
+        with self._lock:
+            self._last_channel = channel
+            if self._set_channel_locked(channel):
+                return
+
+            if not self._recover_interface_locked():
+                return
+
+            # A down/up reset clears the channel on many adapters; retry once.
+            self._set_channel_locked(channel)
 
     def close(self) -> None:
         self.stop_capture()
         if self._restore:
             self._set_monitor(enable=False)
 
-    # ── Monitor mode ──────────────────────────────────────────────────────────
+    # ── Monitor mode / recovery ───────────────────────────────────────────────
 
-    def _set_monitor(self, enable: bool) -> None:
+    def _set_channel_locked(self, channel: int) -> bool:
+        try:
+            r = subprocess.run(
+                ['iw', 'dev', self._iface, 'set', 'channel', str(channel)],
+                capture_output=True, timeout=3,
+            )
+        except Exception:
+            return False
+        return r.returncode == 0
+
+    def _stop_sniffer_locked(self) -> None:
+        if self._sniffer is not None:
+            try:
+                self._sniffer.stop()
+            except Exception:
+                pass
+            self._sniffer = None
+
+    def _restart_sniffer_locked(self) -> None:
+        self._stop_sniffer_locked()
+        if not self._capture_running or self._callback is None:
+            return
+        from scapy.all import AsyncSniffer
+        self._sniffer = AsyncSniffer(
+            iface=self._iface,
+            prn=self._handle_packet,
+            store=False,
+        )
+        self._sniffer.start()
+
+    def _recover_interface_locked(self) -> bool:
+        if not self._auto_recover:
+            return False
+        now = time.monotonic()
+        if self._recover_cooldown > 0 and now - self._last_recover < self._recover_cooldown:
+            return False
+        self._last_recover = now
+
+        self._stop_sniffer_locked()
+        ok = self._set_monitor(enable=True, strict=False)
+        try:
+            self._restart_sniffer_locked()
+        except Exception:
+            ok = False
+        return ok
+
+    def _set_monitor(self, enable: bool, strict: bool = True) -> bool:
         mode = 'monitor' if enable else 'managed'
         steps = [
             ['ip',  'link', 'set', self._iface, 'down'],
             ['iw',  'dev',  self._iface, 'set', 'type', mode],
             ['ip',  'link', 'set', self._iface, 'up'],
         ]
+        ok = True
         for cmd in steps:
             try:
                 r = subprocess.run(cmd, capture_output=True, timeout=5)
-                if r.returncode != 0 and enable:
-                    err = r.stderr.decode(errors='replace').strip()
-                    raise RuntimeError(
-                        f"Cannot set {self._iface} to {mode} mode: {err}\n"
-                        f"  Run as root or grant CAP_NET_ADMIN, and ensure\n"
-                        f"  'iw' and 'ip' are installed (iw iproute2)."
-                    )
+                if r.returncode != 0:
+                    ok = False
+                    if strict and enable:
+                        err = r.stderr.decode(errors='replace').strip()
+                        raise RuntimeError(
+                            f"Cannot set {self._iface} to {mode} mode: {err}\n"
+                            f"  Run as root or grant CAP_NET_ADMIN, and ensure\n"
+                            f"  'iw' and 'ip' are installed (iw iproute2)."
+                        )
             except FileNotFoundError as exc:
-                raise RuntimeError(
-                    f"Command not found: {exc.filename}\n"
-                    f"  Install: sudo apt install iw iproute2"
-                ) from exc
+                if strict:
+                    raise RuntimeError(
+                        f"Command not found: {exc.filename}\n"
+                        f"  Install: sudo apt install iw iproute2"
+                    ) from exc
+                return False
+        return ok
 
     # ── Frame parsing ─────────────────────────────────────────────────────────
 
