@@ -547,8 +547,14 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
     # older config objects still make run sessions write files.
     _frame_count = [0]
     mc = dict(cfg.mode_config)
-    if 'output_path' not in mc and getattr(cfg, 'output', {}).get('path'):
-        mc['output_path'] = cfg.output['path']
+    output_cfg = dict(getattr(cfg, 'output', {}) or {})
+    output_fmt = str(output_cfg.get('format', 'jsonl')).lower()
+    if output_fmt in ('none', 'off', 'false', 'disabled'):
+        mc['output_enabled'] = False
+    else:
+        mc.setdefault('output_format', output_fmt)
+        if 'output_path' not in mc and output_cfg.get('path'):
+            mc['output_path'] = output_cfg['path']
     _orig_on_obs = mc.get('on_observation')
     def _count_frame(obs):
         _frame_count[0] += 1
@@ -561,6 +567,11 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
     print(f'\n  {_hi("▸")} mode={_val(mode_name)}  '
           f'array={_val(cfg.array_id)}  '
           f'antennas={_val(str(array.n))}')
+    out_path = mc.get('output_path')
+    if out_path:
+        print(f'  {_lbl("Session")}  {_path(str(out_path))}')
+    elif not mc.get('output_enabled', True):
+        print(f'  {_lbl("Session")}  {_dim("file output disabled")}')
     print(f'  {_dim("Ctrl-C to stop.")}\n')
 
     stopped = threading.Event()

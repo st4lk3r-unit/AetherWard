@@ -11,6 +11,7 @@ from .base import ScanMode
 from ..signal.frame import Frame
 from ..signal.observation import Observation
 from ..signal.source import SignalProperties, SignalSource
+from ..session import default_session_path
 
 
 def _json_safe(value):
@@ -75,7 +76,12 @@ class WardriverMode(ScanMode):
         self._hop_interval:   float                   = config.get('hop_interval', 0.1)
         self._gps_backend                             = config.get('gps_backend')
         self._gps_interval:   float                   = config.get('gps_interval', 1.0)
-        self._output_path:    Optional[str]           = config.get('output_path')
+        output_fmt = str(config.get('output_format', 'jsonl')).lower()
+        output_enabled = bool(config.get('output_enabled', output_fmt not in ('none', 'off', 'false', 'disabled')))
+        output_path = config.get('output_path')
+        if output_enabled and not output_path:
+            output_path = default_session_path(getattr(array, 'id', None), self.name)
+        self._output_path:    Optional[str]           = output_path if output_enabled else None
         self._store_raw_frames: bool                  = bool(config.get('store_raw_frames', True))
         self._channel_map:    dict[str, list[int]]    = {}
         self._lock     = threading.Lock()
@@ -92,6 +98,7 @@ class WardriverMode(ScanMode):
             path = os.path.expanduser(self._output_path)
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             self._out_file = open(path, 'a', buffering=1)
+            self._output_path = path
 
         for ant in self.array.antennas:
             if ant.backend is None:

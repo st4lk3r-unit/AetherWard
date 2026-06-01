@@ -13,6 +13,8 @@ gain_dbi       = 2.15
 
 [antennas.backend_config]
 interface = "wlan0"
+auto_recover = true
+recover_cooldown = 2.0
 
 [[antennas]]
 id             = "ant1"
@@ -25,6 +27,8 @@ gain_dbi       = 2.15
 
 [antennas.backend_config]
 interface = "wlan1"
+auto_recover = true
+recover_cooldown = 2.0
 
 [gps]
 backend = "gpsd"

@@ -89,6 +89,29 @@ class TestOutputConfigNormalization:
         assert cfg.mode_config['output_path'] == 'explicit.jsonl'
 
 
+    def test_missing_output_path_defaults_to_sessions_dir(self):
+        cfg = AWConfig.from_dict({
+            'mode': 'wardriver',
+            'array_id': 'rig-test',
+            'mode_config': {'channels': [1, 6, 11]},
+            'output': {'format': 'jsonl'},
+        })
+        out = Path(cfg.mode_config['output_path'])
+        assert out.parent == Path.home() / '.aetherward' / 'sessions'
+        assert out.name.startswith('rig-test-')
+        assert out.suffix == '.jsonl'
+        assert cfg.output['path'] == cfg.mode_config['output_path']
+
+    def test_output_none_does_not_create_default_path(self):
+        cfg = AWConfig.from_dict({
+            'mode': 'wardriver',
+            'mode_config': {'channels': [1, 6, 11]},
+            'output': {'format': 'none'},
+        })
+        assert 'output_path' not in cfg.mode_config
+        assert 'path' not in cfg.output
+
+
 class TestWardriverFullFidelityJsonl:
     def test_jsonl_preserves_metadata_raw_frame_and_ap_fields(self):
         out = _session_path('full_fidelity.jsonl')
@@ -254,3 +277,81 @@ class TestProcessAndExportRegressions:
         assert merged['auth_mode'] == '[WPA2-PSK-CCMP][ESS]'
         assert merged['channel'] == 6
         assert merged['pairwise_ciphers'] == ['CCMP']
+
+
+class TestNL80211Recovery:
+    def test_channel_failure_resets_interface_and_retries(self, monkeypatch):
+        calls = []
+        channel_attempts = {'n': 0}
+
+        class Result:
+            def __init__(self, returncode=0, stderr=b''):
+                self.returncode = returncode
+                self.stderr = stderr
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            if cmd[:5] == ['iw', 'dev', 'wlan0', 'set', 'channel']:
+                channel_attempts['n'] += 1
+                if channel_attempts['n'] == 1:
+                    return Result(1, b'Network is down')
+            return Result(0, b'')
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.set_channel(6)
+
+        assert calls == [
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+            ['ip', 'link', 'set', 'wlan0', 'down'],
+            ['iw', 'dev', 'wlan0', 'set', 'type', 'monitor'],
+            ['ip', 'link', 'set', 'wlan0', 'up'],
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+        ]
+
+    def test_auto_recover_can_be_disabled(self, monkeypatch):
+        calls = []
+
+        class Result:
+            returncode = 1
+            stderr = b'Network is down'
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            return Result()
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.configure({'auto_recover': False})
+        b.set_channel(6)
+
+        assert calls == [['iw', 'dev', 'wlan0', 'set', 'channel', '6']]
+
+    def test_recovery_is_throttled_to_avoid_reset_storms(self, monkeypatch):
+        calls = []
+
+        class Result:
+            returncode = 1
+            stderr = b'Network is down'
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            return Result()
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+        monkeypatch.setattr(wifi_nl80211.time, 'monotonic', lambda: 100.0)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.configure({'recover_cooldown': 10.0})
+        b.set_channel(6)
+        b.set_channel(11)
+
+        assert calls == [
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+            ['ip', 'link', 'set', 'wlan0', 'down'],
+            ['iw', 'dev', 'wlan0', 'set', 'type', 'monitor'],
+            ['ip', 'link', 'set', 'wlan0', 'up'],
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '11'],
+        ]
