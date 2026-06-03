@@ -38,6 +38,7 @@ _run_state_lock       = threading.Lock()
 AW_HOME     = Path.home() / '.aetherward'
 AW_CONFIGS  = AW_HOME / 'configs'
 AW_SESSIONS = AW_HOME / 'sessions'
+AW_LOGS     = AW_HOME / 'logs'
 _NAME_RE    = _re.compile(r'^[\w.\-]+$')
 
 
@@ -249,7 +250,7 @@ def _changed(prev: dict, cur: dict, thr_m: float = 5.0) -> bool:
 
 # ── Capture run thread ────────────────────────────────────────────────────────
 
-def _run_capture(config_name: str) -> None:
+def _run_capture(config_name: str, log_run: bool = False) -> None:
     global _run_proc
     import sys, shutil
     aw = shutil.which('aetherward')
@@ -258,6 +259,8 @@ def _run_capture(config_name: str) -> None:
     else:
         aw_py = str(Path(__file__).parent / 'aetherward.py')
         cmd   = [sys.executable, aw_py, 'run', config_name]
+    if log_run:
+        cmd.append('--log')
     _broadcast_log(f'[start] {" ".join(cmd)}')
     try:
         with _run_state_lock:
@@ -512,13 +515,28 @@ class _Handler(BaseHTTPRequestHandler):
                         if raw_all:
                             records.append(r)
                         elif r.get('lat') is not None and r.get('lon') is not None:
-                            from aetherward.session import record_source_id, source_meta_from_record
-                            meta = source_meta_from_record(r)
-                            records.append({**meta, 'lat': r['lat'], 'lon': r['lon'],
-                                            't': r.get('t', 0), 'rssi': r.get('rssi'),
-                                            'id': record_source_id(r),
-                                            'freq': r.get('freq'),
-                                            'protocol': meta.get('protocol', r.get('protocol', ''))})
+                            from aetherward.session import is_gps_record, record_source_id, source_meta_from_record
+                            if is_gps_record(r):
+                                records.append({
+                                    'record_type': 'gps',
+                                    'source': 'gps',
+                                    'id': 'GPS track',
+                                    'lat': r['lat'],
+                                    'lon': r['lon'],
+                                    'alt': r.get('alt'),
+                                    't': r.get('t', 0),
+                                    'fix': r.get('fix'),
+                                    'accuracy_h': r.get('accuracy_h'),
+                                    'num_sats': r.get('num_sats'),
+                                })
+                            else:
+                                meta = source_meta_from_record(r)
+                                records.append({**meta, 'record_type': 'observation',
+                                                'lat': r['lat'], 'lon': r['lon'],
+                                                't': r.get('t', 0), 'rssi': r.get('rssi'),
+                                                'id': record_source_id(r),
+                                                'freq': r.get('freq'),
+                                                'protocol': meta.get('protocol', r.get('protocol', ''))})
                     except ValueError:
                         pass
             self._json(records)
@@ -635,6 +653,7 @@ class _Handler(BaseHTTPRequestHandler):
         # ── Capture run ────────────────────────────────────────────────────────
         elif p == '/api/run/start':
             cfg_name = data.get('config', '').strip()
+            log_run = bool(data.get('log'))
             if not cfg_name:
                 self._json({'error': 'config required'}, 400); return
             _run_stop.set()
@@ -642,9 +661,9 @@ class _Handler(BaseHTTPRequestHandler):
                 _run_thread.join(timeout=3)
             _run_stop.clear()
             _run_thread = threading.Thread(
-                target=_run_capture, args=(cfg_name,), daemon=True)
+                target=_run_capture, args=(cfg_name, log_run), daemon=True)
             _run_thread.start()
-            self._json({'ok': True, 'config': cfg_name})
+            self._json({'ok': True, 'config': cfg_name, 'log': log_run})
 
         elif p == '/api/run/stop':
             _run_stop.set()

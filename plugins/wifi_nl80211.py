@@ -15,6 +15,7 @@ Requires:
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -325,11 +326,20 @@ class NL80211Backend(HardwareBackend):
             if self._set_channel_locked(channel):
                 return
 
+            print(f'[wifi:{self._iface}] channel set failed on ch {channel}; attempting recovery',
+                  file=sys.stderr, flush=True)
             if not self._recover_interface_locked():
+                print(f'[wifi:{self._iface}] recovery skipped/failed',
+                      file=sys.stderr, flush=True)
                 return
 
             # A down/up reset clears the channel on many adapters; retry once.
-            self._set_channel_locked(channel)
+            if self._set_channel_locked(channel):
+                print(f'[wifi:{self._iface}] recovery OK; channel {channel} restored',
+                      flush=True)
+            else:
+                print(f'[wifi:{self._iface}] recovery done but channel {channel} still fails',
+                      file=sys.stderr, flush=True)
 
     def close(self) -> None:
         self.stop_capture()
@@ -380,7 +390,9 @@ class NL80211Backend(HardwareBackend):
         ok = self._set_monitor(enable=True, strict=False)
         try:
             self._restart_sniffer_locked()
-        except Exception:
+        except Exception as exc:
+            print(f'[wifi:{self._iface}] sniffer restart failed: {exc}',
+                  file=sys.stderr, flush=True)
             ok = False
         return ok
 

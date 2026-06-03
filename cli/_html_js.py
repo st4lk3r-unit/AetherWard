@@ -197,9 +197,11 @@ function _renderPathsList(){
       ?`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${p.color};flex-shrink:0"></span>`
       :`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid ${p.color};background:transparent;flex-shrink:0"></span>`;
     const nameStyle=`flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.7rem;${on?'color:var(--txt)':'color:var(--mu);text-decoration:line-through'}`;
+    const sub=p.gps?`${p.points} GPS pts`:`${p.points||0} frame pts`;
     return `<div style="display:flex;align-items:center;gap:.3rem;margin-bottom:.25rem;cursor:pointer" onclick="toggleOnePath(${i})" title="Click to show/hide">
       ${dot}
       <span style="${nameStyle}" title="${p.name}">${p.name}</span>
+      <span style="font-size:.62rem;color:var(--mu);white-space:nowrap">${sub}</span>
       <button style="background:transparent;border:none;color:var(--mu);cursor:pointer;padding:0 .2rem;font-size:.82rem" onclick="event.stopPropagation();removeLoadedPath(${i})">✕</button>
     </div>`;
   }).join('');
@@ -228,27 +230,32 @@ function addPathFromSession(path, name){
   initMap();
   fetch('/api/session/records?path='+encodeURIComponent(path))
     .then(r=>r.json()).then(recs=>{
-      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null);
+      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null).sort((a,b)=>(a.t||0)-(b.t||0));
       if(!georecs.length) return;
+      const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps');
+      const pathrecs=gpsrecs.length?gpsrecs:georecs;
       const color=_PATH_COLORS[_loadedPaths.length%_PATH_COLORS.length];
       const on=_pathsVisible;
-      const layer=L.polyline(georecs.map(r=>[r.lat,r.lon]),
-        {color,opacity:.55,weight:2,dashArray:'6 4'});
+      const layer=L.polyline(pathrecs.map(r=>[r.lat,r.lon]),
+        {color,opacity:.55,weight:2,dashArray:gpsrecs.length?'':'6 4'});
       if(on) layer.addTo(map);
-      const dots=georecs.map(r=>{
-        const dot=L.circleMarker([r.lat,r.lon],{radius:4,color,fillColor:color,fillOpacity:.7,weight:1.2});
+      const dots=pathrecs.map(r=>{
+        const isGps=(r.record_type==='gps'||r.source==='gps');
+        const dot=L.circleMarker([r.lat,r.lon],{radius:isGps?3:4,color,fillColor:color,fillOpacity:.7,weight:1.2});
         const ts=r.t?new Date(r.t*1000).toISOString().slice(11,19):'?';
         const freq=r.freq?(r.freq/1e6).toFixed(0)+' MHz':'?';
         const coords=`<span style="font-family:monospace;font-size:.7rem;color:var(--mu)">${(+r.lat).toFixed(6)}, ${(+r.lon).toFixed(6)}</span>`;
-        const pop=`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
-          +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
-          +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
-          +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
+        const pop=isGps
+          ?`<b>GPS breadcrumb</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
+          :`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
+            +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
+            +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
+            +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
         dot.bindPopup(pop,{maxWidth:230,className:'aw-path-tip'});
         if(on) dot.addTo(map);
         return dot;
       });
-      _loadedPaths.push({name,path,color,layer,dots,visible:on});
+      _loadedPaths.push({name,path,color,layer,dots,visible:on,gps:gpsrecs.length,points:pathrecs.length});
       _renderPathsList();
     });
 }
@@ -557,7 +564,8 @@ function appendSolveLog(text){
 function startRun(){
   const cfg=document.getElementById('run-config').value;
   if(!cfg){alert('Select a config first.');return;}
-  fetch('/api/run/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})})
+  const log=!!document.getElementById('run-log-file')?.checked;
+  fetch('/api/run/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,log})})
     .then(()=>loadStatus());
 }
 function stopRun(){fetch('/api/run/stop',{method:'POST'}).then(()=>loadStatus());}

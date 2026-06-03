@@ -42,6 +42,26 @@ def default_session_path(array_id: str | None = None,
     return str(base / f'{stem}-{stamp}{suffix}')
 
 
+
+
+def record_type(rec: dict) -> str:
+    """Return the normalized session record type.
+
+    Legacy observation records usually have no explicit type, so they are
+    treated as observations by readers unless marked otherwise.
+    """
+    rt = rec.get('record_type', rec.get('type', 'observation'))
+    return str(rt or 'observation').lower()
+
+
+def is_gps_record(rec: dict) -> bool:
+    return record_type(rec) == 'gps'
+
+
+def is_observation_record(rec: dict) -> bool:
+    return not is_gps_record(rec)
+
+
 def record_metadata(rec: dict) -> dict:
     meta = rec.get('metadata')
     return meta if isinstance(meta, dict) else {}
