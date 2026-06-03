@@ -167,7 +167,7 @@ def _default_session_desc() -> str:
 
 def _choose_session_output_path(default_name: str = 'default', suffix: str = '.jsonl') -> tuple[bool, Optional[str]]:
     """Return (use_default_folder, custom_path)."""
-    default_example = default_session_path(default_name, 'warddriver', suffix=suffix)
+    default_example = default_session_path(default_name, 'wardriver', suffix=suffix)
     choice = _ask_str(
         'Use default sessions path or custom path', 'default',
         hint='default/custom or direct file path',

@@ -388,6 +388,15 @@ input[type=checkbox]{accent-color:var(--acc)}
       </div>
       <div class="fg">
         <label>
+          Run log
+          <span class="tip" data-tip="When enabled, the run is tee'd to ~/.aetherward/logs/sessions-&lt;config&gt;-&lt;timestamp&gt;.log. Useful for debugging GPS stalls, Wi-Fi adapter recovery and hidden backend errors.">?</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:var(--txt);margin-top:.35rem">
+          <input id="run-log-file" type="checkbox" checked> file
+        </label>
+      </div>
+      <div class="fg">
+        <label>
           Capture session
           <span class="tip" data-tip="Starts the full aetherward pipeline.\nWardriver mode: channel-hopping scan, writes raw frames + parsed AP metadata to session JSONL.\nMonitor mode requires the interface to already be in monitor mode\n(or run aetherward with sufficient privileges).">?</span>
         </label>
@@ -398,7 +407,7 @@ input[type=checkbox]{accent-color:var(--acc)}
       </div>
     </div>
     <div style="font-size:.75rem;color:var(--mu);line-height:1.4">
-      <b style="color:var(--txt)">Run</b> captures raw frames + AP metadata → session JSONL. &nbsp;
+      <b style="color:var(--txt)">Run</b> captures raw frames + AP metadata → session JSONL. Enable run log for ~/.aetherward/logs diagnostics. &nbsp;
       <b style="color:var(--txt)">Solve</b> reads that file and computes positions — both tabs can run simultaneously.
     </div>
   </div>

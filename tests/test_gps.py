@@ -69,3 +69,43 @@ class TestStaticGPSBackend:
             b = StaticGPSBackend(lat=lat, lon=0.0)
             p = b.get_position()
             assert p.lat == pytest.approx(lat)
+
+class TestGPSDBackendFreshPoll:
+    def test_get_position_drops_streaming_backlog_and_uses_poll_snapshot(self, monkeypatch):
+        import select
+        from aetherward.hardware.gps import GPSDBackend
+
+        class FakeSock:
+            def __init__(self):
+                self.chunks = [
+                    b'{"class":"TPV","mode":3,"lat":1.0,"lon":1.0,"time":"2026-06-02T00:00:00Z"}\n'
+                ]
+                self.sent = []
+
+            def sendall(self, data):
+                self.sent.append(data)
+                if data == b'?POLL;\n':
+                    self.chunks.append(
+                        b'{"class":"POLL","tpv":['
+                        b'{"class":"TPV","mode":3,"lat":2.0,"lon":2.0,"time":"2026-06-02T00:00:01Z"},'
+                        b'{"class":"TPV","mode":3,"lat":3.0,"lon":3.0,"time":"2026-06-02T00:00:02Z"}'
+                        b']}\n'
+                    )
+
+            def recv(self, n):
+                return self.chunks.pop(0) if self.chunks else b''
+
+        fake = FakeSock()
+
+        def fake_select(readers, *_args, **_kwargs):
+            return (readers, [], []) if fake.chunks else ([], [], [])
+
+        monkeypatch.setattr(select, 'select', fake_select)
+        b = GPSDBackend()
+        b._sock = fake
+        pos = b.get_position()
+
+        assert pos is not None
+        assert pos.lat == pytest.approx(3.0)
+        assert pos.lon == pytest.approx(3.0)
+        assert b'?POLL;\n' in fake.sent

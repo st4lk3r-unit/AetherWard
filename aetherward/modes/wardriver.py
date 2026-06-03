@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -60,6 +61,7 @@ class WardriverMode(ScanMode):
         hop_interval      float           seconds per channel dwell (default: 0.1)
         gps_backend       GPSBackend      if set, polls GPS and updates the array
         gps_interval      float           GPS poll interval, seconds (default: 1.0)
+        gps_max_age       float           max GPS fix age before it is considered stale (default: 5.0)
         output_path       str             write JSONL observations here (optional)
         store_raw_frames  bool            store raw frame bytes as hex (default: True)
         on_source         callable        called when a new SignalSource appears
@@ -76,6 +78,7 @@ class WardriverMode(ScanMode):
         self._hop_interval:   float                   = config.get('hop_interval', 0.1)
         self._gps_backend                             = config.get('gps_backend')
         self._gps_interval:   float                   = config.get('gps_interval', 1.0)
+        self._gps_max_age:    float                   = float(config.get('gps_max_age', 5.0))
         output_fmt = str(config.get('output_format', 'jsonl')).lower()
         output_enabled = bool(config.get('output_enabled', output_fmt not in ('none', 'off', 'false', 'disabled')))
         output_path = config.get('output_path')
@@ -176,14 +179,64 @@ class WardriverMode(ScanMode):
                 idx += 1
             time.sleep(self._hop_interval)
 
-    def _gps_worker(self) -> None:
-        while self._running:
+    def _gps_age(self, gps, now: float | None = None) -> Optional[float]:
+        ts = getattr(gps, 'timestamp', 0.0) if gps is not None else 0.0
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0.0:
+            return None
+        return max(0.0, (now or time.time()) - ts)
+
+    def _gps_is_fresh(self, gps, now: float | None = None) -> bool:
+        if gps is None or not gps.is_valid():
+            return False
+        age = self._gps_age(gps, now)
+        return age is None or age <= self._gps_max_age
+
+    def _clear_stale_array_position(self, now: float | None = None) -> None:
+        pos = getattr(self.array, 'absolute_position', None)
+        if pos is not None and not self._gps_is_fresh(pos, now):
             try:
-                pos = self._gps_backend.get_position()
-                if pos is not None:
-                    self.array.update_position(pos)
+                self.array.absolute_position = None
             except Exception:
                 pass
+
+    def _gps_worker(self) -> None:
+        last_warn = 0.0
+        while self._running:
+            now = time.time()
+            try:
+                pos = self._gps_backend.get_position()
+                if pos is not None and pos.is_valid() and self._gps_is_fresh(pos, now):
+                    self.array.update_position(pos)
+                    self._write_gps(pos)
+                elif pos is not None and pos.is_valid():
+                    self._clear_stale_array_position(now)
+                    if now - last_warn > 15.0:
+                        age = self._gps_age(pos, now)
+                        print(f'[gps] stale fix ignored age={age:.1f}s max={self._gps_max_age:.1f}s',
+                              file=sys.stderr, flush=True)
+                        last_warn = now
+                elif now - last_warn > 15.0:
+                    self._clear_stale_array_position(now)
+                    print('[gps] no valid fix; not geotagging new observations',
+                          file=sys.stderr, flush=True)
+                    last_warn = now
+                    if getattr(self._gps_backend, '_sock', True) is None:
+                        try:
+                            self._gps_backend.initialize()
+                            print('[gps] reconnected position source', flush=True)
+                        except Exception as exc:
+                            print(f'[gps] reconnect failed: {exc}',
+                                  file=sys.stderr, flush=True)
+            except Exception as exc:
+                self._clear_stale_array_position(now)
+                if now - last_warn > 15.0:
+                    print(f'[gps] position source error: {exc}',
+                          file=sys.stderr, flush=True)
+                    last_warn = now
             time.sleep(self._gps_interval)
 
     # ── Frame handling ───────────────────────────────────────────────────
@@ -228,6 +281,32 @@ class WardriverMode(ScanMode):
 
     # ── Output ───────────────────────────────────────────────────────────
 
+    def _write_gps(self, gps) -> None:
+        """Append a GPS breadcrumb record independent of captured frames.
+
+        Older sessions only contained frame observations, so the map path was
+        actually a frame-location trail.  If capture stalls, the displayed
+        route can appear truncated even while GPS kept moving.  GPS breadcrumb
+        records preserve the real driven path and are ignored by source
+        solvers/processors.
+        """
+        if self._out_file is None or gps is None or not self._gps_is_fresh(gps):
+            return
+        rec = {
+            'schema':      'aetherward.session.v1',
+            'record_type': 'gps',
+            't':           gps.timestamp or time.time(),
+            'lat':         gps.lat,
+            'lon':         gps.lon,
+            'alt':         gps.alt,
+            'fix':         int(gps.fix_type),
+            'accuracy_h':  gps.accuracy_h,
+            'accuracy_v':  gps.accuracy_v,
+            'num_sats':    gps.num_sats,
+        }
+        with self._out_lock:
+            self._out_file.write(json.dumps(rec, separators=(',', ':')) + '\n')
+
     def _write_obs(self, obs: Observation) -> None:
         if self._out_file is None:
             return
@@ -235,8 +314,10 @@ class WardriverMode(ScanMode):
         gps = obs.array_absolute
         meta = _json_safe(dict(frame.metadata or {}))
         rec: dict = {
-            't':         frame.timestamp,
-            'freq':      frame.frequency,
+            'schema':      'aetherward.session.v1',
+            'record_type': 'observation',
+            't':           frame.timestamp,
+            'freq':        frame.frequency,
             'bw':        frame.bandwidth,
             'rssi':      obs.rssi,
             'ant':       obs.antenna_id,
@@ -268,11 +349,14 @@ class WardriverMode(ScanMode):
             rec['raw_frame_hex'] = frame.data.hex()
             rec['raw_frame_b64'] = base64.b64encode(frame.data).decode('ascii')
 
-        if gps is not None and gps.is_valid():
+        if gps is not None and self._gps_is_fresh(gps):
             rec['lat'] = gps.lat
             rec['lon'] = gps.lon
             rec['alt'] = gps.alt
             rec['fix'] = int(gps.fix_type)
+            age = self._gps_age(gps)
+            if age is not None:
+                rec['gps_age_s'] = round(age, 3)
         with self._out_lock:
             self._out_file.write(json.dumps(rec, separators=(',', ':')) + '\n')
 
