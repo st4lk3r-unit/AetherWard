@@ -15,6 +15,7 @@ from cli.aetherward import (
     _save_config, _scan_hardware, _sep, _val,
 )
 from cli._commands import _run_session
+from aetherward.session import default_session_dir, default_session_path
 
 # ── Step runner (q = go back one step) ───────────────────────────────────────
 class _StepRunner:
@@ -160,6 +161,44 @@ def _configure_one_antenna(hw: dict, idx: int, mode: str,
     }
 
 
+def _default_session_desc() -> str:
+    return f'{default_session_dir()}/<config>-YYYYmmdd-HHMMSS.jsonl'
+
+
+def _choose_session_output_path(default_name: str = 'default', suffix: str = '.jsonl') -> tuple[bool, Optional[str]]:
+    """Return (use_default_folder, custom_path)."""
+    default_example = default_session_path(default_name, 'wardriver', suffix=suffix)
+    choice = _ask_str(
+        'Use default sessions path or custom path', 'default',
+        hint='default/custom or direct file path',
+        help_text=(
+            'Session file location',
+            'Type "default" to store each run as a new timestamped file in:\n'
+            f'  {default_session_dir()}\n\n'
+            'Type "custom" to choose an exact path.  You can also paste a\n'
+            'file path directly here for faster setup.'
+        ),
+    ).strip()
+    low = choice.lower()
+    if low in ('default', 'd'):
+        return True, None
+    if low in ('custom', 'c'):
+        path = _ask_str(
+            'Save captures to', default_example,
+            hint=f'{suffix} — one record per frame',
+            help_text=(
+                'Output file path',
+                'Every captured frame is appended as a single JSON line.\n'
+                'The file is created on first capture and never truncated,\n'
+                'so you can safely resume interrupted sessions.\n\n'
+                'Open in another terminal while running:\n'
+                f'  tail -f {default_example} | jq .'
+            ),
+        )
+        return False, path
+    return False, choice
+
+
 # ── Wizard — quick path ───────────────────────────────────────────────────────
 def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
     wifi = hw['wifi']
@@ -295,19 +334,8 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
 
     def _step_output(ctx: dict) -> dict:
         _sep('Output')
-        out_path = _ask_str(
-            'Save captures to', str(Path.home() / '.aetherward' / 'sessions' / 'aw-session.jsonl'),
-            hint='.jsonl — one JSON record per frame',
-            help_text=(
-                'Output file path',
-                'Every captured frame is appended as a single JSON line.\n'
-                'The file is created on first capture and never truncated,\n'
-                'so you can safely resume interrupted sessions.\n\n'
-                'Open in another terminal while running:\n'
-                '  tail -f ~/.aetherward/sessions/aw-session.jsonl | jq .'
-            ),
-        )
-        return {'out_path': out_path}
+        use_default, out_path = _choose_session_output_path('quick')
+        return {'out_default': use_default, 'out_path': out_path}
 
     def _step_imu(ctx: dict) -> dict:
         mode = ctx['mode']
@@ -339,7 +367,8 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
     mode = ctx['mode']
     sel  = ctx['selected_ifaces']
     freq = ctx['freq']
-    out  = ctx['out_path']
+    out  = ctx.get('out_path')
+    out_default = bool(ctx.get('out_default'))
     imu  = ctx['imu']
     gps  = ctx['gps']
 
@@ -359,7 +388,9 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
     mc: dict = {}
     if mode == 'wardriver':
         mc = {'channels': list(range(1, 14)), 'hop_interval': 0.1,
-              'output_path': out, 'store_raw_frames': True}
+              'store_raw_frames': True}
+        if not out_default and out:
+            mc['output_path'] = out
     elif mode == 'trilateration':
         mc = {'channel': 6, 'reference_antenna': antennas[0]['id'],
               'correlation_window': 0.001, 'group_timeout': 0.05}
@@ -375,7 +406,8 @@ def _wizard_quick(hw: dict) -> Optional[dict]:  # noqa: C901
         'imu':         imu,
         'sync':        {'source': 'software'},
         'mode_config': mc,
-        'output':      {'format': 'jsonl', 'path': out},
+        'output':      ({'format': 'jsonl', 'path_policy': 'default'}
+                        if out_default else {'format': 'jsonl', 'path': out}),
     }
 
 
@@ -599,9 +631,14 @@ def _wizard_custom(hw: dict) -> Optional[dict]:  # noqa: C901
         ))
         output: dict = {'format': out_fmt}
         if out_fmt != 'none':
-            output['path'] = _ask_str('Path', str(Path.home() / '.aetherward' / 'sessions' / f'aw-session.{out_fmt}'))
+            use_default, out_path = _choose_session_output_path('custom', suffix=f'.{out_fmt}')
+            if use_default:
+                output['path_policy'] = 'default'
+            else:
+                output['path'] = out_path
             if mode == 'wardriver':
-                mc['output_path'] = output['path']
+                if not use_default and out_path:
+                    mc['output_path'] = out_path
                 mc.setdefault('store_raw_frames', True)
         return {'output': output}
 

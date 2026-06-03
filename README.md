@@ -1,253 +1,544 @@
 <div align="center">
 
-<img src="docs/banner.png" alt="AetherWard" width="720">
+<img src="img/banner.png" alt="AetherWard" width="720">
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-WTFPL-darkred?style=flat-square)
 [![Tests](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml/badge.svg)](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml)
-![Version](https://img.shields.io/badge/version-0.3.1-orange?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.3.2-orange?style=flat-square)
 
 **Hardware-agnostic RF observation framework.**  
-Capture, record, and geolocate RF emitters using consumer wireless hardware.
+Capture, record, sanity-check, map, and solve RF observations from Wi-Fi adapters and other pluggable radio backends.
 
 </div>
 
-## Overview
+## What AetherWard does
 
-AetherWard ties together three things most tools conflate:
+AetherWard is built around a simple workflow:
 
-- **Capture** — a plugin interface that abstracts any radio hardware behind a uniform `Frame` callback
-- **Record** — append-only JSONL session files readable by any tool
-- **Solve** — position solvers (RSS trilateration, TDOA hyperbolic, passive array sensing) operating on the recorded frames
+1. **Create a config** describing your radio adapter, GPS source, and scan mode.
+2. **Run a capture session**. AetherWard writes append-only JSONL records under `~/.aetherward/sessions/`.
+3. **Open the web UI or post-process the session** to inspect the route, export data, or solve approximate source positions.
 
-Swap a WiFi NIC for an SDR, a LoRa dongle, or a custom driver without touching any solver code.
+The framework deliberately separates:
 
-| Mode | Technique | Hardware | Typical accuracy | State |
-|------|-----------|----------|-----------------|-------|
-| `wardriver` | RSS trilateration | 1+ WiFi NIC, GPS | 5–50 m | OK |
-| `trilateration` | TDOA / hyperbolic | 4+ synced NICs, GPS, PPS | 0.3–3 m | ⚠ WIP |
-| `array_sensing` | RSSI/CSI variance | 2+ NICs | direction vector | ⚠ WIP |
+- **Capture** — hardware plugins produce normalized `Frame` objects.
+- **Record** — every observation is written to JSONL so other tools can inspect it.
+- **Solve/process** — map/export/solver code runs on recorded sessions.
+
+> Use AetherWard only where you are legally allowed to observe radio traffic. Wardriver mode is passive, but session files can contain SSIDs, BSSIDs, station MAC addresses, GPS coordinates, and raw 802.11 management frames.
+
+## Supported modes
+
+| Mode | What it is for | Typical hardware | State |
+|------|----------------|------------------|-------|
+| `wardriver` | Wi-Fi observation, GPS-tagged sessions, maps, RSS estimates | 1+ monitor-mode Wi-Fi adapter + optional GPS | usable |
+| `trilateration` | TDOA/RSS source solving with a fixed array | 4+ synced antennas, PPS/GPSDO preferred | experimental |
+| `array_sensing` | RSSI/CSI variance and direction/event sensing | 2+ adapters | experimental |
+
+Most beginners should start with **`wardriver`**.
 
 ## Install
 
-AetherWard is not on PyPI — install directly from the source tree:
+AetherWard includes an installer. Use it first. It asks which optional parts you want and creates a clean virtual environment by default.
+
+### From a release zip
+
+```bash
+unzip AetherWard-x.x.zip
+cd AetherWard-x.x
+bash install.sh
+```
+
+Recommended answers for a normal Wi-Fi + GPS wardriving setup:
+
+```text
+Build C core?                             N
+GPS support (gpsd-py3)?                   Y
+YAML config support (pyyaml)?             Y
+RTL-SDR support (pyrtlsdr)?               N
+WiFi capture support (scapy)?             Y
+Developer tools?                          N
+Installation target?                      1  # virtual environment
+```
+
+After a virtualenv install, run AetherWard with either:
+
+```bash
+source .venv/bin/activate
+aetherward
+```
+
+or without activating:
+
+```bash
+./bin/aetherward
+```
+
+### From git
 
 ```bash
 git clone https://github.com/st4lk3r-unit/AetherWard
 cd AetherWard
-
-# create and activate a virtualenv (recommended)
-python3 -m venv .venv
-source .venv/bin/activate
-
-# install the package and its entry points
-pip install .
-
-# optional extras
-pip install ".[yaml]"   # YAML config support (pyyaml)
-pip install ".[sdr]"    # RTL-SDR backend (pyrtlsdr)
-pip install ".[dev]"    # pytest, mypy, ruff
+bash install.sh
 ```
 
-Core CI excludes generated showcase/session suites by default and also checks Python compilation plus the C core build:
+### Manual install, for developers
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[gps,yaml,dev]'
+pip install 'scapy>=2.5'      # needed for the Linux Wi-Fi backend
+```
+
+AetherWard requires **Python 3.11+** and `numpy`. The Linux Wi-Fi backend also needs Scapy and root/CAP_NET_ADMIN permissions to switch adapters into monitor mode.
+
+## Prepare hardware
+
+### Wi-Fi adapter
+
+Use a USB Wi-Fi adapter that supports monitor mode. Do not use the same adapter for Internet access and capture.
+
+Find the interface name:
+
+```bash
+ip link
+```
+
+Typical names are `wlan0`, `wlan1`, `wlx...`.
+
+If NetworkManager keeps taking the adapter back, disconnect it from managed Wi-Fi before running AetherWard. The NL80211 backend will try to put the interface into monitor mode and can auto-recover it if channel hopping fails.
+
+### GPS / gpsd
+
+For real wardriving, use a GPS receiver through `gpsd`.
+
+Debian/Ubuntu example:
+
+```bash
+sudo apt install gpsd gpsd-clients
+ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock
+cgps
+```
+
+Replace `/dev/ttyUSB0` with your GPS device. `cgps` should show a moving fix before you expect good geotagging.
+
+If you only want to test the UI indoors, use the wizard and choose no GPS or a static GPS position.
+
+## First run: beginner workflow
+
+### 1. Start the web UI
+
+The web UI is the easiest path because it contains the config wizard, editor, runner, map, session browser, and log pane.
+
+```bash
+./bin/aetherward web --open
+```
+
+If you installed manually inside an activated virtualenv:
+
+```bash
+aetherward web --open
+```
+
+Open the shown URL, usually:
+
+```text
+http://127.0.0.1:8080
+```
+
+### 2. Create a config
+
+In the web UI, open the config wizard.
+
+The first question is the **config / array name**. This name becomes:
+
+- the saved config name under `~/.aetherward/configs/`
+- `array_id` inside the config
+- the default session filename prefix
+
+For a one-adapter GPS wardriver setup, select:
+
+```text
+mode: wardriver
+adapter/interface: wlan1          # or your real capture interface
+GPS: gpsd
+session output: default sessions path
+channels: 1-13                    # or 1,6,11 for faster common-channel scans
+hop interval: 0.1 to 0.2 seconds
+store raw frames: true
+```
+
+The generated config should contain this output block:
+
+```toml
+[output]
+format = "jsonl"
+path_policy = "default"
+```
+
+With `path_policy = "default"`, each run creates a fresh timestamped session file:
+
+```text
+~/.aetherward/sessions/<array_id>-YYYYmmdd-HHMMSS.jsonl
+```
+
+### 3. Validate the config
+
+```bash
+./bin/aetherward validate ~/.aetherward/configs/YOUR-CONFIG.toml
+```
+
+or, if the config is saved by name:
+
+```bash
+./bin/aetherward config list
+./bin/aetherward config load YOUR-CONFIG
+```
+
+### 4. Run capture with logging
+
+Wi-Fi monitor mode usually needs root. Use the venv launcher path directly with `sudo`:
+
+```bash
+sudo ./bin/aetherward run YOUR-CONFIG --log
+```
+
+A default run log is written to:
+
+```text
+~/.aetherward/logs/sessions-<config-name>-<timestamp>.log
+```
+
+A session JSONL is written to:
+
+```text
+~/.aetherward/sessions/<array_id>-<timestamp>.jsonl
+```
+
+During the run, watch the status line. In wardriver mode you should see frame count, source count, GPS coordinates, and GPS age. If GPS age grows or says stale, stop and debug GPS before trusting the route.
+
+### 5. Inspect the result
+
+Open the web UI session browser, or run a raw sanity check:
+
+```bash
+./bin/aetherward session-check ~/.aetherward/sessions/YOUR-SESSION.jsonl --details --html
+```
+
+This creates a simple HTML map next to the session file. It draws **every geotagged sample directly**, without solver or web UI logic. Use it to answer:
+
+- does the raw session reach the end of the route?
+- are GPS coordinates stale/repeated?
+- are timestamps jumping backward?
+- are there malformed JSON lines?
+
+If the sanity HTML reaches the end but the web map does not, the bug is in map loading/rendering. If the sanity HTML stops early too, the session data itself is stale or incomplete.
+
+### 6. Export or solve
+
+Wardrive-style exports:
+
+```bash
+./bin/aetherward process ~/.aetherward/sessions/YOUR-SESSION.jsonl --format geojson
+./bin/aetherward process ~/.aetherward/sessions/YOUR-SESSION.jsonl --format csv
+./bin/aetherward process ~/.aetherward/sessions/YOUR-SESSION.jsonl --format wigle
+```
+
+RSS solving:
+
+```bash
+./bin/aetherward solve ~/.aetherward/sessions/YOUR-SESSION.jsonl --n-exp 2.5
+```
+
+Follow a growing file while a run is still active:
+
+```bash
+./bin/aetherward solve ~/.aetherward/sessions/YOUR-SESSION.jsonl --follow --interval 2
+```
+
+## CLI reference
+
+```bash
+aetherward <command> [options]
+aw          <command> [options]
+```
+
+If you installed into the repo virtualenv and do not want to activate it, replace `aetherward` with `./bin/aetherward`.
+
+| Command | Purpose |
+|---------|---------|
+| `aetherward` | Interactive terminal menu |
+| `aetherward wizard` | Terminal config wizard |
+| `aetherward web --open` | Browser UI: wizard, editor, runner, live map, sessions |
+| `aetherward run [CONFIG]` | Start a capture session |
+| `aetherward run CONFIG --log` | Run and tee stdout/stderr to `~/.aetherward/logs/` |
+| `aetherward run CONFIG --log-file FILE` | Run with a custom log path |
+| `aetherward validate CONFIG` | Validate config syntax/schema |
+| `aetherward config list` | List saved configs |
+| `aetherward config load NAME` | Print a saved config |
+| `aetherward config delete NAME` | Delete a saved config |
+| `aetherward session-check SESSION --details --html` | Raw JSONL sanity report and dumb map |
+| `aetherward process SESSION --format geojson` | Export observations/sources |
+| `aetherward solve SESSION` | Solve approximate source positions |
+| `aetherward info` | Version and C-core status |
+| `aetherward install` | Install a command wrapper to PATH |
+| `aetherward uninstall` | Remove AetherWard artifacts |
+
+Useful run examples:
+
+```bash
+sudo ./bin/aetherward run my-wardriver --log
+sudo ./bin/aetherward run ~/.aetherward/configs/my-wardriver.toml --log
+sudo ./bin/aetherward run my-wardriver --log-file /tmp/aetherward-run.log
+```
+
+Useful session-check examples:
+
+```bash
+./bin/aetherward session-check session.jsonl --details
+./bin/aetherward session-check session.jsonl --html
+./bin/aetherward session-check session.jsonl --geojson --csv
+```
+
+## Configuration basics
+
+Configs live in:
+
+```text
+~/.aetherward/configs/
+```
+
+Minimal one-adapter wardriver config:
+
+```toml
+array_id = "my-wardriver"
+mode = "wardriver"
+
+[[antennas]]
+id = "wlan1"
+backend = "plugins.wifi_nl80211.NL80211Backend"
+backend_config = {interface = "wlan1", auto_recover = true, recover_cooldown = 2.0}
+frequency_range = [2400000000, 2500000000]
+position = [0, 0, 0]
+orientation_euler = [0.0, 0.0, 0.0]
+gain_dbi = 0.0
+
+[gps]
+backend = "gpsd"
+host = "localhost"
+port = 2947
+
+[sync]
+source = "software"
+
+[mode_config]
+channels = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+hop_interval = 0.2
+store_raw_frames = true
+
+[output]
+format = "jsonl"
+path_policy = "default"
+```
+
+Important fields:
+
+| Field | Meaning |
+|-------|---------|
+| `array_id` | Human name for the rig; also used in default session filenames |
+| `backend_config.interface` | Linux Wi-Fi interface to put into monitor mode |
+| `auto_recover` | Try down/up monitor-mode recovery if channel hopping fails |
+| `channels` | Wi-Fi channels to hop through |
+| `hop_interval` | Seconds to stay on each channel |
+| `store_raw_frames` | Store raw frame hex/base64 in the JSONL session |
+| `[output].path_policy = "default"` | Create a fresh timestamped session in `~/.aetherward/sessions/` |
+
+Full reference: [`docs/config.md`](docs/config.md).
+
+## Files and folders
+
+| Path | What it contains |
+|------|------------------|
+| `~/.aetherward/` | AetherWard home directory |
+| `~/.aetherward/configs/` | Saved TOML/JSON/YAML configs |
+| `~/.aetherward/sessions/` | Recorded JSONL sessions |
+| `~/.aetherward/logs/` | Optional run logs created by `--log` or the web UI log checkbox |
+| `~/.aetherward/.last_config` | Last selected config |
+
+## Session files
+
+Sessions are newline-delimited JSON. They are intentionally append-only so they can be tailed, copied, and inspected after crashes.
+
+Observation record example:
+
+```json
+{"schema":"aetherward.session.v1","record_type":"observation","t":1716000000.1,"freq":2412000000,"bw":20000000,"rssi":-62.0,"ant":"wlan1","protocol":"802.11","id":"aa:bb:cc:dd:ee:ff","ssid":"Example","channel":6,"lat":48.8566,"lon":2.3522,"alt":35.0,"fix":3,"gps_age_s":0.7}
+```
+
+GPS breadcrumb example:
+
+```json
+{"schema":"aetherward.session.v1","record_type":"gps","t":1716000001.0,"lat":48.8567,"lon":2.3523,"alt":35.2,"fix":3}
+```
+
+The web map prefers GPS breadcrumb records for the driven path when present. Solvers and source processors ignore GPS breadcrumbs so they do not become fake RF sources.
+
+Full format reference: [`docs/session-format.md`](docs/session-format.md).
+
+## Web UI
+
+```bash
+./bin/aetherward web --host 127.0.0.1 --port 8080 --open
+```
+
+The web UI provides:
+
+- config wizard and config editor
+- run button for saved configs
+- run-log checkbox
+- live status/log pane
+- session browser
+- raw path and source map
+- ENU/array geometry viewer
+
+The server is a Python stdlib HTTP server with Server-Sent Events. There is no npm build step.
+
+## Troubleshooting
+
+### `aetherward: command not found`
+
+If you used the default virtualenv install:
+
+```bash
+source .venv/bin/activate
+aetherward info
+```
+
+or:
+
+```bash
+./bin/aetherward info
+```
+
+### Permission errors or adapter will not enter monitor mode
+
+Run capture as root:
+
+```bash
+sudo ./bin/aetherward run YOUR-CONFIG --log
+```
+
+Also make sure the adapter is not your active Internet adapter and is not being controlled by NetworkManager.
+
+### GPS appears to move, but the map/session stalls
+
+Run with logging and watch GPS age:
+
+```bash
+sudo ./bin/aetherward run YOUR-CONFIG --log
+```
+
+Then sanity-check the session:
+
+```bash
+./bin/aetherward session-check ~/.aetherward/sessions/YOUR-SESSION.jsonl --details --html
+```
+
+Look for stale coordinate runs, missing geotags, timestamp backsteps, or large gaps. The raw sanity HTML is the fastest way to tell whether the session file or the map UI is to blame.
+
+### Session file is not created
+
+Use the default output policy:
+
+```toml
+[output]
+format = "jsonl"
+path_policy = "default"
+```
+
+Do not set `format = "none"` unless you intentionally want no session file.
+
+### Too few frames
+
+Try increasing dwell time:
+
+```toml
+[mode_config]
+hop_interval = 0.2
+```
+
+Or reduce the channel list to common channels:
+
+```toml
+channels = [1, 6, 11]
+```
+
+### Adapter drops during channel hopping
+
+Keep auto-recovery enabled:
+
+```toml
+backend_config = {interface = "wlan1", auto_recover = true, recover_cooldown = 2.0}
+```
+
+Check the run log for `set channel` failures and interface recovery attempts.
+
+## Development and tests
+
+Developer install:
+
+```bash
+bash install.sh       # answer yes to Developer tools
+source .venv/bin/activate
+```
+
+Run checks:
 
 ```bash
 python -m compileall -q aetherward cli plugins tests
 python -m pytest tests/ -m "not showcase"
 cmake -S . -B build && cmake --build build
-python -m pytest tests/ -m showcase      # optional: regenerate demo sessions
+python -m pytest tests/ -m showcase      # optional generated/demo session tests
 ```
-
-Requires **Python 3.11+** and **numpy ≥ 1.24**. Everything else is optional.  
-See [docs/backends.md](docs/backends.md) for per-backend requirements.
-
-After `pip install .`, the `aetherward` and `aw` commands are available in the virtualenv.  
-To install them system-wide (outside a venv), run `sudo aetherward install`.
-
-**GPS:** install the `gpsd` system daemon and plug in a GNSS dongle:
-
-```bash
-sudo apt install gpsd
-sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock   # replace with your device
-```
-
-AetherWard connects to gpsd automatically when `gps.backend = "gpsd"` is set in config.
-
-## Quick start
-
-**Wardriving:**
-
-```bash
-aetherward wizard          # guided setup → saves config to ~/.aetherward/configs/
-sudo aetherward run        # start capturing (needs CAP_NET_ADMIN or root)
-aetherward web --open      # live map in browser
-```
-
-**TDOA (⚠ work in progress — 4 antennas, PPS sync):**
-
-```bash
-sudo aetherward run examples/trilateration_4ant.toml
-```
-
-**Post-process a recorded session:**
-
-```bash
-aetherward solve session.jsonl --n-exp 2.5 --follow
-aetherward process session.jsonl --mode wardrive-map --format geojson
-```
-
-## CLI
-
-```
-aetherward <command> [options]
-aw          <command> [options]     # short alias
-```
-
-| Command | Description |
-|---------|-------------|
-| `wizard` | Guided interactive configuration |
-| `run [CONFIG]` | Start a capture session |
-| `solve SESSION` | RSS/TDOA solver on a recorded session |
-| `process SESSION` | Export to GeoJSON / CSV / KML / WiGLE |
-| `config list\|load\|delete` | Manage saved configurations |
-| `validate CONFIG` | Syntax-check a config file |
-| `info` | Version, C core status, framework summary |
-| `web [--host H] [--port P] [--open]` | Start the browser UI |
-| `install / uninstall` | Add/remove CLI from `/usr/local/bin` |
-
-**`solve` key options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--n-exp N` | `2.5` | Path loss exponent (`2.0` LOS → `4.5` heavy NLOS) |
-| `--min-obs N` | `3` | Minimum observations before solving |
-| `--follow` | off | Re-solve continuously as the file grows |
-| `--interval S` | `2` | Re-solve interval in seconds with `--follow` |
-| `--output FILE` | — | Write solved positions to JSONL |
-
-## Configuration
-
-Configs are TOML, JSON, or YAML stored in `~/.aetherward/configs/`.
-
-```toml
-mode     = "wardriver"
-array_id = "my-rig"
-
-[[antennas]]
-id              = "wlan0"
-backend         = "plugins.wifi_nl80211.NL80211Backend"
-backend_config  = {interface = "wlan0"}
-frequency_range = [2400000000, 2500000000]
-position        = [0.0, 0.0, 0.0]          # ENU offset from GPS receiver (metres)
-gain_dbi        = 0.0
-
-[gps]
-backend = "gpsd"
-
-[mode_config]
-channels         = [1, 6, 11]
-hop_interval     = 0.1
-output_path      = "~/.aetherward/sessions/session.jsonl"
-store_raw_frames = true
-
-[output]
-format = "jsonl"
-path   = "~/.aetherward/sessions/session.jsonl"
-```
-
-Full annotated examples in [`examples/`](examples/).  
-Complete key reference in [docs/config.md](docs/config.md).
-
-## Web UI
-
-```bash
-aetherward web --port 8080 --open
-```
-
-- **Live map** — solved positions on a tile map
-- **ENU 3-D viewer** — local coordinate frame + antenna geometry
-- **Log pane** — solver and runner output
-- **Session browser** — load any `~/.aetherward/sessions/*.jsonl`
-- **Config editor** — create, edit, delete configs in-browser
-
-Pure stdlib HTTP server + Server-Sent Events. No npm, no build step.
-
-## Session format
-
-Append-only JSONL. One record per observation. Open with any editor, stream with `tail -f`, query with `jq`.
-
-**Wardriver record:**
-```json
-{"t": 1716000000.1, "freq": 2412000000, "bw": 20000000, "rssi": -62.0,
- "ant": "wlan0", "protocol": "802.11", "id": "aa:bb:cc:dd:ee:ff",
- "ssid": "Home", "auth_mode": "[WPA2-PSK-CCMP][ESS]", "channel": 6,
- "metadata": {"frame_subtype": "beacon"}, "raw_frame_hex": "001122...",
- "lat": 48.8566, "lon": 2.3522, "alt": 35.0, "fix": 3}
-```
-
-Full format reference in [docs/session-format.md](docs/session-format.md).
-
-## Plugin API
-
-Drop a class anywhere on `sys.path`, reference it by class path in config:
-
-```toml
-backend = "my_package.my_module.MyBackend"
-```
-
-```python
-from aetherward.hardware.backend import HardwareBackend, BackendCapabilities
-from aetherward.signal.frame import Frame
-
-class MyBackend(HardwareBackend):
-    def initialize(self): ...
-    def configure(self, config: dict): ...
-    def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(frequency_min=433e6, frequency_max=434e6,
-                                   bandwidth_max=250e3, supports_channel_hop=False,
-                                   supports_csi=False, supports_hw_timestamp=False,
-                                   supports_tdoa_sync=False, max_antennas=1)
-    def start_capture(self, callback): ...
-    def stop_capture(self): ...
-    def set_frequency(self, hz): ...
-    def close(self): ...
-```
-
-Full guide with CSI and hardware-timestamp details in [docs/plugin-api.md](docs/plugin-api.md).
-
-## Documentation
-
-| Doc | Contents |
-|-----|----------|
-| [docs/modes.md](docs/modes.md) | Wardriver, TDOA trilateration, array sensing — how each works, solver internals |
-| [docs/config.md](docs/config.md) | Full config key reference for all modes, backends, and sync sources |
-| [docs/backends.md](docs/backends.md) | Hardware + GPS + IMU backends, capabilities, setup requirements |
-| [docs/plugin-api.md](docs/plugin-api.md) | Writing custom hardware backends, CSI support, hw timestamps |
-| [docs/session-format.md](docs/session-format.md) | JSONL record types, field reference, jq recipes |
 
 ## Architecture
 
-```
+```text
 aetherward/
-├── core.py              TDOA solver — Gauss-Newton, C binding + Python fallback
-├── config/schema.py     AWConfig, AntennaConfig, GPSConfig, IMUConfig, SyncConfig
-├── antenna/             Antenna, AntennaArray, RadiationPattern
+├── core.py              TDOA solver: C binding + Python fallback
+├── config/schema.py     AWConfig, antenna/GPS/IMU/sync config models
+├── antenna/             Antenna, AntennaArray, radiation patterns
 ├── hardware/            HardwareBackend ABC, GPS backends, IMU backends
-├── modes/               ScanMode ABC → wardriver, trilateration, array_sensing
-├── orientation/         Quaternion — Hamilton product, Euler, axis-angle
-├── position/            AbsolutePosition (WGS84), RelativePosition (ENU), RSS solver
+├── modes/               wardriver, trilateration, array_sensing
+├── orientation/         quaternion and Euler helpers
+├── position/            WGS84/ENU positions and RSS solver
+├── session.py           session path + record helpers
+├── session_sanity.py    raw JSONL sanity checker
 └── signal/              Frame, Observation, SignalSource
 
 cli/
-├── aetherward.py        Entry point, argparse, UI primitives
-├── _commands.py         run, solve, process, install, config, validate, info
-├── _wizard.py           Interactive guided configuration
-└── web.py               HTTP server + SSE + solver workers
+├── aetherward.py        entry point and argparse
+├── _commands.py         run, solve, process, validate, session-check
+├── _wizard.py           terminal wizard
+└── web.py               web server and SSE workers
 
 plugins/
-└── wifi_nl80211.py      NL80211Backend — Linux 802.11 monitor mode (Scapy)
+└── wifi_nl80211.py      Linux 802.11 monitor-mode backend
 ```
 
-**Coordinate systems:** absolute (WGS84, lat/lon/alt) and relative (local ENU, metres) are strictly separated. All geometry math lives in ENU; projection to WGS84 is always explicit.
+Coordinate systems are kept separate: GPS is WGS84 latitude/longitude/altitude, while geometry math uses local ENU metres.
 
-**Optional C core:** `libaw.so` in the package root provides ~10× faster TDOA solving. The pure-Python fallback is always active. Check: `aetherward info`.
+The optional C core accelerates TDOA/DSP paths. Wardriver mode works without it.
+
+## More documentation
+
+| Document | Contents |
+|----------|----------|
+| [`docs/config.md`](docs/config.md) | Complete config key reference |
+| [`docs/backends.md`](docs/backends.md) | Hardware, GPS, IMU backend notes |
+| [`docs/modes.md`](docs/modes.md) | Wardriver, TDOA, and array-sensing internals |
+| [`docs/session-format.md`](docs/session-format.md) | JSONL fields, record types, jq recipes |
+| [`docs/plugin-api.md`](docs/plugin-api.md) | Writing custom hardware backends |

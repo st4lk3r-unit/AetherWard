@@ -54,42 +54,109 @@ class GPSDBackend(GPSBackend):
             )
         s.settimeout(None)  # blocking mode; we control timing via select
         self._sock = s
-        # Drain the VERSION banner gpsd sends on connect, but keep any
-        # newline-framed JSON we receive so get_position() can parse it.
+        self._buf = ''
+
+        # Drain the VERSION banner gpsd sends on connect.  Do not keep old
+        # TPV lines here: retaining a streaming backlog makes long captures
+        # appear to "move" while lagging minutes behind the real ride.
         deadline = time.time() + 1.0
         while time.time() < deadline:
             r, _, _ = _sel.select([s], [], [], 0.2)
             if not r:
                 break
             try:
-                self._buf += s.recv(4096).decode('utf-8', errors='replace')
+                if not s.recv(4096):
+                    break
             except OSError:
                 break
 
-        # Activate the device and ask gpsd for JSON TPV reports. gpsd POLL
-        # only returns useful data for devices that have been WATCHed first.
+        # Activate the device, but do NOT request streaming JSON.  get_position()
+        # asks for an explicit POLL snapshot each time.  Streaming JSON can
+        # outpace our 1 Hz polling loop and create an ever-growing stale queue.
         try:
-            s.sendall(b'?WATCH={"enable":true,"json":true};\n')
+            s.sendall(b'?WATCH={"enable":true,"json":false};\n')
         except OSError:
             self._sock = None
             raise
+        self._drain_socket(0.25)
+
+    def _drain_socket(self, max_seconds: float = 0.0) -> None:
+        """Drop any pending gpsd bytes before a fresh POLL request."""
+        if self._sock is None:
+            return
+        import select as _sel
+        deadline = time.time() + max(0.0, max_seconds)
+        while True:
+            timeout = max(0.0, deadline - time.time()) if max_seconds else 0.0
+            r, _, _ = _sel.select([self._sock], [], [], timeout)
+            if not r:
+                break
+            try:
+                chunk = self._sock.recv(4096)  # type: ignore[attr-defined]
+            except OSError:
+                self._sock = None
+                self._buf = ''
+                return
+            if not chunk:
+                self._sock = None
+                self._buf = ''
+                return
+            if not max_seconds:
+                # Drain all currently-readable data, then stop as soon as the
+                # socket has no immediate bytes available.
+                continue
+            if time.time() >= deadline:
+                break
+        self._buf = ''
+
+    @staticmethod
+    def _tpv_to_position(tpv: dict) -> Optional[AbsolutePosition]:
+        _fix_map = {2: FixType.FIX_2D, 3: FixType.FIX_3D}
+        fix = _fix_map.get(tpv.get('mode', 0))
+        if fix is None:
+            return None
+        if tpv.get('lat') is None or tpv.get('lon') is None:
+            return None
+        ts_raw = tpv.get('time', '')
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(ts_raw.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            ts = time.time()
+        return AbsolutePosition(
+            lat=tpv.get('lat', 0.0),
+            lon=tpv.get('lon', 0.0),
+            alt=tpv.get('alt', 0.0),
+            accuracy_h=tpv.get('eph', float('inf')),
+            accuracy_v=tpv.get('epv', float('inf')),
+            timestamp=ts,
+            fix_type=fix,
+            num_sats=tpv.get('satellites', tpv.get('used', 0)) or 0,
+        )
 
     def get_position(self) -> Optional[AbsolutePosition]:
         if self._sock is None:
             return None
         import json, select as _sel
-        # Request current snapshot — no streaming race conditions
+
+        # Never parse an old queued TPV before a fresh snapshot.  This is the
+        # key anti-stale guard for long runs.
+        self._drain_socket(0.0)
+        if self._sock is None:
+            return None
+
         try:
             self._sock.sendall(b'?POLL;\n')  # type: ignore[attr-defined]
         except OSError:
             self._sock = None
             return None
-        # Read until we receive the POLL response (usually < 100 ms)
+
+        best: Optional[AbsolutePosition] = None
         deadline = time.time() + 2.0
         while time.time() < deadline:
             r, _, _ = _sel.select([self._sock], [], [], 0.3)
             if not r:
-                break
+                continue
             try:
                 chunk = self._sock.recv(4096).decode('utf-8', errors='replace')  # type: ignore[attr-defined]
             except OSError:
@@ -108,38 +175,23 @@ class GPSDBackend(GPSBackend):
                     report = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if report.get('class') == 'TPV':
-                    tpvs = [report]
-                elif report.get('class') == 'POLL':
-                    # POLL contains a list of TPV objects (one per device)
-                    tpvs = report.get('tpv', [])
-                else:
+
+                cls = report.get('class')
+                if cls == 'TPV':
+                    pos = self._tpv_to_position(report)
+                    if pos and (best is None or pos.timestamp >= best.timestamp):
+                        best = pos
                     continue
 
-                for tpv in tpvs:
-                    _fix_map = {2: FixType.FIX_2D, 3: FixType.FIX_3D}
-                    fix = _fix_map.get(tpv.get('mode', 0))
-                    if fix is None:
-                        continue
-                    ts_raw = tpv.get('time', '')
-                    try:
-                        from datetime import datetime
-                        ts = datetime.fromisoformat(
-                            ts_raw.replace('Z', '+00:00')).timestamp()
-                    except Exception:
-                        ts = time.time()
-                    return AbsolutePosition(
-                        lat=tpv.get('lat', 0.0),
-                        lon=tpv.get('lon', 0.0),
-                        alt=tpv.get('alt', 0.0),
-                        accuracy_h=tpv.get('eph', float('inf')),
-                        accuracy_v=tpv.get('epv', float('inf')),
-                        timestamp=ts,
-                        fix_type=fix,
-                    )
-                if report.get('class') == 'POLL':
-                    return None  # POLL received, no device has a fix yet
-        return None
+                if cls == 'POLL':
+                    for tpv in report.get('tpv', []) or []:
+                        if not isinstance(tpv, dict):
+                            continue
+                        pos = self._tpv_to_position(tpv)
+                        if pos and (best is None or pos.timestamp >= best.timestamp):
+                            best = pos
+                    return best
+        return best
 
     def close(self) -> None:
         if self._sock is not None:

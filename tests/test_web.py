@@ -13,7 +13,7 @@ import pytest
 # Make sure cli package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from cli.web import (
-    _ansi_to_html, _detect_hardware, _ThreadedHTTPServer, _Handler,
+    _ansi_to_html, _detect_hardware, _ThreadedHTTPServer, _Handler, AW_SESSIONS,
 )
 
 
@@ -157,6 +157,25 @@ class TestGetEndpoints:
         status, body = _get(server, '/api/positions/all')
         assert status == 200
         assert isinstance(json.loads(body), list)
+
+    def test_session_records_exposes_gps_breadcrumbs(self, server):
+        AW_SESSIONS.mkdir(parents=True, exist_ok=True)
+        path = AW_SESSIONS / f'test-gps-path-{int(time.time())}.jsonl'
+        path.write_text('\n'.join([
+            json.dumps({'record_type': 'gps', 't': 1_700_000_000, 'lat': 48.0, 'lon': 2.0, 'fix': 2}),
+            json.dumps({'id': 'aa:bb:cc:dd:ee:ff', 't': 1_700_000_001, 'lat': 48.1, 'lon': 2.1,
+                        'freq': 2_437_000_000, 'rssi': -50, 'metadata': {'ssid': 'AP'}}),
+        ]) + '\n')
+        try:
+            status, body = _get(server, '/api/session/records?path=' + str(path))
+            assert status == 200
+            rows = json.loads(body)
+            assert rows[0]['record_type'] == 'gps'
+            assert rows[0]['id'] == 'GPS track'
+            assert rows[1]['record_type'] == 'observation'
+            assert rows[1]['id'] == 'aa:bb:cc:dd:ee:ff'
+        finally:
+            path.unlink(missing_ok=True)
 
     def test_unknown_endpoint_404(self, server):
         status, _ = _get(server, '/api/nonexistent')

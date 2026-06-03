@@ -32,12 +32,14 @@ MozillaLBSBackend = _MozillaLBS
 AW_HOME     = Path.home() / '.aetherward'
 AW_CONFIGS  = AW_HOME / 'configs'
 AW_SESSIONS = AW_HOME / 'sessions'
+AW_LOGS     = AW_HOME / 'logs'
 AW_LAST     = AW_HOME / '.last_config'
 
 def _ensure_home() -> None:
     AW_HOME.mkdir(exist_ok=True)
     AW_CONFIGS.mkdir(exist_ok=True)
     AW_SESSIONS.mkdir(exist_ok=True)
+    AW_LOGS.mkdir(exist_ok=True)
 
 # ── Colour — sourced from shared palette ──────────────────────────────────────
 import cli.palette as _pal
@@ -930,7 +932,8 @@ def _interactive_menu() -> None:
             return
         run_opts = [(str(p), p.stem, str(p)) for p in cfgs]
         chosen = _choose('Select config', run_opts)
-        _run_session(chosen, None)
+        log_run = _confirm('Create run log under ~/.aetherward/logs?', default=True)
+        _run_session(chosen, None, log_run=log_run)
     elif choice == 'info':
         _cmd_info()
 
@@ -938,11 +941,11 @@ def _interactive_menu() -> None:
 def main() -> None:
     # Lazy imports here avoid circular import when running as __main__
     global _wizard, _cmd_config, _cmd_info, _cmd_install, _cmd_process
-    global _cmd_solve, _cmd_uninstall, _cmd_validate, _run_session
+    global _cmd_session_check, _cmd_solve, _cmd_uninstall, _cmd_validate, _run_session
     from cli._wizard import _wizard
     from cli._commands import (
         _cmd_config, _cmd_info, _cmd_install, _cmd_process,
-        _cmd_solve, _cmd_uninstall, _cmd_validate, _run_session,
+        _cmd_session_check, _cmd_solve, _cmd_uninstall, _cmd_validate, _run_session,
     )
     _ensure_home()
 
@@ -976,6 +979,10 @@ def main() -> None:
     run_p = sub.add_parser('run', help='Start a scan session')
     run_p.add_argument('config', nargs='?')
     run_p.add_argument('--mode', choices=['wardriver', 'trilateration', 'array_sensing'])
+    run_p.add_argument('--log', dest='log_run', action='store_true',
+                       help='Tee stdout/stderr to ~/.aetherward/logs/sessions-<config>-<timestamp>.log')
+    run_p.add_argument('--log-file', metavar='FILE',
+                       help='Custom run log file path; implies --log')
 
     solve_p = sub.add_parser('solve', help='Live RSS/TDOA solver on a session JSONL')
     solve_p.add_argument('session',             help='Path to .jsonl session file')
@@ -1008,6 +1015,19 @@ def main() -> None:
                         help='Output file path (default: next to session file)')
     proc_p.add_argument('--config', metavar='NAME',
                         help='Array config name — required for tdoa-replay')
+
+    chk_p = sub.add_parser('session-check', help='Sanity-check a JSONL session file')
+    chk_p.add_argument('session', help='Path to .jsonl session file')
+    chk_p.add_argument('--html', nargs='?', const='', metavar='FILE',
+                       help='Write a dumb raw HTML map. Without FILE, writes next to session.')
+    chk_p.add_argument('--geojson', nargs='?', const='', metavar='FILE',
+                       help='Write dumb GeoJSON from every geotagged sample')
+    chk_p.add_argument('--csv', nargs='?', const='', metavar='FILE',
+                       help='Write geotagged samples as CSV')
+    chk_p.add_argument('--details', action='store_true',
+                       help='Show detailed stale coordinate runs and time/jump gaps')
+    chk_p.add_argument('--fail-on-error', action='store_true',
+                       help='Exit non-zero on malformed JSON or invalid/no geotagged records')
 
     val_p = sub.add_parser('validate', help='Validate a config file')
     val_p.add_argument('config')
@@ -1044,6 +1064,7 @@ def main() -> None:
     elif args.command == 'uninstall': _cmd_uninstall()
     elif args.command == 'solve':     _cmd_solve(args)
     elif args.command == 'process':   _cmd_process(args)
+    elif args.command == 'session-check': _cmd_session_check(args)
     elif args.command == 'validate':  _cmd_validate(args.config)
     elif args.command == 'config':    _cmd_config(args)
     elif args.command == 'web':
@@ -1061,7 +1082,9 @@ def main() -> None:
                 else:
                     print(_err('\n  No config found. Run: aetherward wizard\n'))
                     sys.exit(1)
-        _run_session(cfg_arg, getattr(args, 'mode', None))
+        _run_session(cfg_arg, getattr(args, 'mode', None),
+                     log_run=bool(getattr(args, 'log_run', False) or getattr(args, 'log_file', None)),
+                     log_file=getattr(args, 'log_file', None))
 
 if __name__ == '__main__':
     main()

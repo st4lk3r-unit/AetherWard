@@ -388,6 +388,15 @@ input[type=checkbox]{accent-color:var(--acc)}
       </div>
       <div class="fg">
         <label>
+          Run log
+          <span class="tip" data-tip="When enabled, the run is tee'd to ~/.aetherward/logs/sessions-&lt;config&gt;-&lt;timestamp&gt;.log. Useful for debugging GPS stalls, Wi-Fi adapter recovery and hidden backend errors.">?</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:var(--txt);margin-top:.35rem">
+          <input id="run-log-file" type="checkbox" checked> file
+        </label>
+      </div>
+      <div class="fg">
+        <label>
           Capture session
           <span class="tip" data-tip="Starts the full aetherward pipeline.\nWardriver mode: channel-hopping scan, writes raw frames + parsed AP metadata to session JSONL.\nMonitor mode requires the interface to already be in monitor mode\n(or run aetherward with sufficient privileges).">?</span>
         </label>
@@ -398,7 +407,7 @@ input[type=checkbox]{accent-color:var(--acc)}
       </div>
     </div>
     <div style="font-size:.75rem;color:var(--mu);line-height:1.4">
-      <b style="color:var(--txt)">Run</b> captures raw frames + AP metadata → session JSONL. &nbsp;
+      <b style="color:var(--txt)">Run</b> captures raw frames + AP metadata → session JSONL. Enable run log for ~/.aetherward/logs diagnostics. &nbsp;
       <b style="color:var(--txt)">Solve</b> reads that file and computes positions — both tabs can run simultaneously.
     </div>
   </div>
@@ -597,9 +606,23 @@ input[type=checkbox]{accent-color:var(--acc)}
       <!-- progress dots -->
       <div class="wiz-progress" id="wiz-prog"></div>
 
-      <!-- Step 1: Mode -->
+      <!-- Step 1: Config name -->
       <div class="wiz-step active" id="wiz-s1">
-        <div class="wiz-step-title">Select operating mode</div>
+        <div class="wiz-step-title">Config name</div>
+        <div class="fg" style="margin-bottom:1rem">
+          <label>Config / array name <span class="tip" data-tip="First prompt by design: this becomes both the saved config filename and array_id in the generated TOML. Default session filenames also derive from it.">?</span></label>
+          <input id="wiz-name" value="my-config" placeholder="van-roof" style="font-family:monospace" oninput="wizNameChanged(this.value)" autofocus>
+          <div id="wiz-name-err" style="color:#ff6b6b;font-size:.79rem;margin-top:.35rem;display:none">Enter a config name before continuing.</div>
+        </div>
+        <div style="font-size:.77rem;color:var(--mu);line-height:1.45">
+          This name is written into <code>array_id</code> and used as the config filename under <code>~/.aetherward/configs/</code>.
+          Pick the rig/session profile name first so every generated default stays consistent.
+        </div>
+      </div>
+
+      <!-- Step 2: Operating mode + session output -->
+      <div class="wiz-step" id="wiz-s2">
+        <div class="wiz-step-title">Operating mode and session output</div>
         <div class="wiz-choices">
           <label class="wiz-choice sel" id="wc-wardriver" onclick="wizSetMode('wardriver')">
             <input type="radio" name="wiz-mode" value="wardriver" checked>
@@ -617,10 +640,23 @@ input[type=checkbox]{accent-color:var(--acc)}
             <div class="wiz-choice-desc">Passive RF fingerprinting. Detects presence, motion, and absence — not position. Uses CSI (Channel State Information) if available, RSSI variance fallback for any adapter.</div></div>
           </label>
         </div>
+        <div class="fg" style="margin-top:1rem">
+          <label>Session output <span class="tip" data-tip="Use the default sessions path to create a fresh timestamped file on each run. Choose custom only when you want one exact file path. Choose none to disable file output.">?</span></label>
+          <select id="wiz-output-policy" onchange="wizOutputPolicyChange()">
+            <option value="default" selected>Use default sessions path</option>
+            <option value="custom">Custom path</option>
+            <option value="none">No file output</option>
+          </select>
+          <div id="wiz-output-hint" style="font-size:.77rem;color:var(--mu);margin-top:.35rem">Default: create a new timestamped file in ~/.aetherward/sessions/ for every run.</div>
+        </div>
+        <div class="fg" id="wiz-output-custom" style="display:none;margin-top:.7rem">
+          <label>Custom session file path</label>
+          <input id="wiz-output" value="~/.aetherward/sessions/custom.jsonl" style="font-family:monospace" oninput="W.output=this.value">
+        </div>
       </div>
 
-      <!-- Step 2: Antennas -->
-      <div class="wiz-step" id="wiz-s2">
+      <!-- Step 3: Antennas -->
+      <div class="wiz-step" id="wiz-s3">
         <div class="wiz-step-title">Antenna configuration</div>
         <div id="wiz-iface-hint" style="font-size:.77rem;color:var(--mu);margin-bottom:.6rem;display:none">
           Detected interfaces: <span id="wiz-iface-list"></span>
@@ -634,8 +670,8 @@ input[type=checkbox]{accent-color:var(--acc)}
         <div id="wiz-ants"></div>
       </div>
 
-      <!-- Step 3: GPS -->
-      <div class="wiz-step" id="wiz-s3">
+      <!-- Step 4: GPS -->
+      <div class="wiz-step" id="wiz-s4">
         <div class="wiz-step-title">Position source (GPS)</div>
         <div class="fg" style="margin-bottom:.75rem">
           <label>Backend <span class="tip" data-tip="gpsd: hardware GNSS via gpsd daemon (recommended)\ngeoclue: system location service (D-Bus)\nmls: Mozilla Location Service — WiFi scan triangulation, no GPS hardware needed\nstatic: fixed lat/lon for stationary deployments\nnone: no GPS — frames will not be geo-tagged">?</span></label>
@@ -656,8 +692,8 @@ input[type=checkbox]{accent-color:var(--acc)}
         </div>
       </div>
 
-      <!-- Step 4: Time sync -->
-      <div class="wiz-step" id="wiz-s4">
+      <!-- Step 5: Time sync -->
+      <div class="wiz-step" id="wiz-s5">
         <div class="wiz-step-title">Time synchronisation</div>
         <div class="wiz-choices">
           <label class="wiz-choice sel" id="wts-software" onclick="wizSetSync('software')">
@@ -686,8 +722,8 @@ input[type=checkbox]{accent-color:var(--acc)}
         </div>
       </div>
 
-      <!-- Step 5: Advanced settings (mode-specific) -->
-      <div class="wiz-step" id="wiz-s5">
+      <!-- Step 6: Advanced settings (mode-specific) -->
+      <div class="wiz-step" id="wiz-s6">
         <div class="wiz-step-title">Advanced settings</div>
 
         <!-- Wardriver-specific -->
@@ -702,9 +738,8 @@ input[type=checkbox]{accent-color:var(--acc)}
               <input id="wiz-hop" type="number" step="0.01" min="0.05" value="0.1" style="width:90px" oninput="W.hopInterval=+this.value">
             </div>
           </div>
-          <div class="fg" style="margin-top:.7rem">
-            <label>Session file path <span class="tip" data-tip="Where captured frames are written.\nDirectories are created automatically.\nUse ~ for home directory.">?</span></label>
-            <input id="wiz-output" value="~/.aetherward/sessions/session.jsonl" style="font-family:monospace" oninput="W.output=this.value">
+          <div style="font-size:.77rem;color:var(--mu);margin-top:.7rem">
+            Session output is selected on step 2. The default creates a fresh timestamped JSONL under ~/.aetherward/sessions/ on each run.
           </div>
         </div>
 
@@ -759,12 +794,11 @@ input[type=checkbox]{accent-color:var(--acc)}
         </div>
       </div>
 
-      <!-- Step 6: Review -->
-      <div class="wiz-step" id="wiz-s6">
+      <!-- Step 7: Review -->
+      <div class="wiz-step" id="wiz-s7">
         <div class="wiz-step-title">Review &amp; save</div>
-        <div class="fg" style="margin-bottom:.75rem">
-          <label>Config name</label>
-          <input id="wiz-name" placeholder="my-config" style="font-family:monospace">
+        <div style="font-size:.77rem;color:var(--mu);margin-bottom:.75rem">
+          Config / array name is the first wizard prompt and is written as <code>array_id</code>. Go back to change it, or edit the TOML manually before saving.
         </div>
         <div class="fg">
           <label>Generated TOML <span class="tip" data-tip="You can edit this before saving.\nThe file will be written to ~/.aetherward/configs/<name>.toml">?</span></label>
@@ -775,7 +809,7 @@ input[type=checkbox]{accent-color:var(--acc)}
     </div>
     <div class="modal-ftr" style="justify-content:space-between">
       <button class="btn btn-s" id="wiz-prev" onclick="wizPrev()" disabled>← Back</button>
-      <span id="wiz-step-lbl" style="font-size:.8rem;color:var(--mu);align-self:center">Step 1 of 6</span>
+      <span id="wiz-step-lbl" style="font-size:.8rem;color:var(--mu);align-self:center">Step 1 of 7</span>
       <div style="display:flex;gap:.5rem">
         <button class="btn btn-s" onclick="closeWizard()">Cancel</button>
         <button class="btn btn-p" id="wiz-next" onclick="wizNext()">Next →</button>

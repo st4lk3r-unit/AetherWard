@@ -13,7 +13,7 @@ from aetherward.config.schema import AWConfig
 from aetherward.modes.wardriver import WardriverMode
 from aetherward.position.absolute import AbsolutePosition, FixType
 from aetherward.signal.frame import Frame
-from aetherward.session import record_source_id, source_meta_from_record
+from aetherward.session import is_gps_record, record_source_id, source_meta_from_record
 from cli._commands import _proc_wardrive_map
 from plugins import wifi_nl80211
 
@@ -89,6 +89,29 @@ class TestOutputConfigNormalization:
         assert cfg.mode_config['output_path'] == 'explicit.jsonl'
 
 
+    def test_missing_output_path_defaults_to_sessions_dir(self):
+        cfg = AWConfig.from_dict({
+            'mode': 'wardriver',
+            'array_id': 'rig-test',
+            'mode_config': {'channels': [1, 6, 11]},
+            'output': {'format': 'jsonl'},
+        })
+        out = Path(cfg.mode_config['output_path'])
+        assert out.parent == Path.home() / '.aetherward' / 'sessions'
+        assert out.name.startswith('rig-test-')
+        assert out.suffix == '.jsonl'
+        assert cfg.output['path'] == cfg.mode_config['output_path']
+
+    def test_output_none_does_not_create_default_path(self):
+        cfg = AWConfig.from_dict({
+            'mode': 'wardriver',
+            'mode_config': {'channels': [1, 6, 11]},
+            'output': {'format': 'none'},
+        })
+        assert 'output_path' not in cfg.mode_config
+        assert 'path' not in cfg.output
+
+
 class TestWardriverFullFidelityJsonl:
     def test_jsonl_preserves_metadata_raw_frame_and_ap_fields(self):
         out = _session_path('full_fidelity.jsonl')
@@ -109,6 +132,25 @@ class TestWardriverFullFidelityJsonl:
         assert base64.b64decode(rec['raw_frame_b64']) == _ap_frame().data
         assert rec['lat'] == pytest.approx(48.8566)
         assert rec['fix'] == int(FixType.FIX_3D)
+        assert rec['record_type'] == 'observation'
+
+    def test_gps_breadcrumb_record_is_written_independently_of_frames(self):
+        out = _session_path('gps_breadcrumb.jsonl')
+        out.unlink(missing_ok=True)
+        mode = WardriverMode(_make_array(), {'output_path': str(out), 'gps_max_age': 999999999.0})
+        mode.start()
+        gps = AbsolutePosition(lat=48.8570, lon=2.3530, alt=36.0,
+                               accuracy_h=3.5, timestamp=1_700_000_001.0,
+                               fix_type=FixType.FIX_3D, num_sats=9)
+        mode._write_gps(gps)
+        mode.stop()
+
+        rec = json.loads(out.read_text().strip())
+        assert is_gps_record(rec)
+        assert rec['lat'] == pytest.approx(48.8570)
+        assert rec['lon'] == pytest.approx(2.3530)
+        assert rec['accuracy_h'] == pytest.approx(3.5)
+        assert rec['num_sats'] == 9
 
     def test_store_raw_frames_false_removes_raw_payload_fields(self):
         out = _session_path('no_raw.jsonl')
@@ -224,6 +266,21 @@ class TestProcessAndExportRegressions:
         assert props['security'] == 'WPA2'
         assert props['pairwise_ciphers'] == ['CCMP']
 
+    def test_process_ignores_gps_breadcrumb_records_as_sources(self):
+        session = _session_path('process_with_gps.jsonl')
+        records = [
+            {'record_type': 'gps', 't': 1_700_000_000, 'lat': 48.0, 'lon': 2.0, 'fix': 2},
+            *self._records(),
+            {'record_type': 'gps', 't': 1_700_000_010, 'lat': 48.1, 'lon': 2.1, 'fix': 2},
+        ]
+        session.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+        out = session.with_suffix('.geojson')
+        out.unlink(missing_ok=True)
+        _proc_wardrive_map(records, 'geojson', None, str(session))
+        doc = json.loads(out.read_text())
+        ids = [f['properties']['id'] for f in doc['features']]
+        assert ids == ['aa:bb:cc:dd:ee:ff']
+
     def test_wigle_export_keeps_auth_mode(self):
         out = _session_path('process_wigle.wigle.csv')
         out.unlink(missing_ok=True)
@@ -254,3 +311,104 @@ class TestProcessAndExportRegressions:
         assert merged['auth_mode'] == '[WPA2-PSK-CCMP][ESS]'
         assert merged['channel'] == 6
         assert merged['pairwise_ciphers'] == ['CCMP']
+
+
+class TestNL80211Recovery:
+    def test_channel_failure_resets_interface_and_retries(self, monkeypatch):
+        calls = []
+        channel_attempts = {'n': 0}
+
+        class Result:
+            def __init__(self, returncode=0, stderr=b''):
+                self.returncode = returncode
+                self.stderr = stderr
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            if cmd[:5] == ['iw', 'dev', 'wlan0', 'set', 'channel']:
+                channel_attempts['n'] += 1
+                if channel_attempts['n'] == 1:
+                    return Result(1, b'Network is down')
+            return Result(0, b'')
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.set_channel(6)
+
+        assert calls == [
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+            ['ip', 'link', 'set', 'wlan0', 'down'],
+            ['iw', 'dev', 'wlan0', 'set', 'type', 'monitor'],
+            ['ip', 'link', 'set', 'wlan0', 'up'],
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+        ]
+
+    def test_auto_recover_can_be_disabled(self, monkeypatch):
+        calls = []
+
+        class Result:
+            returncode = 1
+            stderr = b'Network is down'
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            return Result()
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.configure({'auto_recover': False})
+        b.set_channel(6)
+
+        assert calls == [['iw', 'dev', 'wlan0', 'set', 'channel', '6']]
+
+    def test_recovery_is_throttled_to_avoid_reset_storms(self, monkeypatch):
+        calls = []
+
+        class Result:
+            returncode = 1
+            stderr = b'Network is down'
+
+        def fake_run(cmd, capture_output=True, timeout=None):
+            calls.append(list(cmd))
+            return Result()
+
+        monkeypatch.setattr(wifi_nl80211.subprocess, 'run', fake_run)
+        monkeypatch.setattr(wifi_nl80211.time, 'monotonic', lambda: 100.0)
+
+        b = wifi_nl80211.NL80211Backend(interface='wlan0')
+        b.configure({'recover_cooldown': 10.0})
+        b.set_channel(6)
+        b.set_channel(11)
+
+        assert calls == [
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '6'],
+            ['ip', 'link', 'set', 'wlan0', 'down'],
+            ['iw', 'dev', 'wlan0', 'set', 'type', 'monitor'],
+            ['ip', 'link', 'set', 'wlan0', 'up'],
+            ['iw', 'dev', 'wlan0', 'set', 'channel', '11'],
+        ]
+
+class TestGpsStalenessRegression:
+    def test_stale_array_position_is_not_written_to_observation(self):
+        out = _session_path('stale_gps_not_geotagged.jsonl')
+        out.unlink(missing_ok=True)
+        gps = AbsolutePosition(lat=48.0, lon=2.0, alt=0.0,
+                               timestamp=1_000_000.0,
+                               fix_type=FixType.FIX_3D)
+        mode = WardriverMode(_make_array(gps=gps), {
+            'output_path': str(out),
+            'gps_max_age': 5.0,
+        })
+        mode.start()
+        mode._handle(_ap_frame(), 'wlan0')
+        mode.stop()
+
+        rec = json.loads(out.read_text().strip())
+        assert 'lat' not in rec
+        assert 'lon' not in rec
+
+    def test_wardriver_spelling_is_used_for_gps_ownership(self):
+        assert 'warddriver' not in Path('cli/_commands.py').read_text()
+        assert 'warddriver' not in Path('cli/_wizard.py').read_text()

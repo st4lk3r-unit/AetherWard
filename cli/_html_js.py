@@ -2,13 +2,14 @@ _HTML_JS = r"""<script>
 // ── State ─────────────────────────────────────────────────────────────────────
 const srcs = {}, mkrs = {};
 let map = null, totalUpd = 0;
-const STEPS = 6;
+const STEPS = 7;
 let wStep = 1;
 const W = {
+  configName:'my-config',
   mode:'wardriver', antennas:[{id:'wlan0',preset:'wifi24',freqMin:2400000000,freqMax:2500000000,backend:'plugins.wifi_nl80211.NL80211Backend',x:0,y:0,z:0}],
   gps:'gpsd', lat:0, lon:0, alt:0,
   sync:'software', syncDev:'',
-  output:'~/.aetherward/sessions/session.jsonl',
+  outputPolicy:'default', output:'',
   // mode-specific advanced config (mirrors CLI wizard custom)
   channels:'1,2,3,4,5,6,7,8,9,10,11,12,13', hopInterval:0.1,
   triChannel:6, corrWindow:0.001, groupTimeout:0.05,
@@ -196,9 +197,11 @@ function _renderPathsList(){
       ?`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${p.color};flex-shrink:0"></span>`
       :`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid ${p.color};background:transparent;flex-shrink:0"></span>`;
     const nameStyle=`flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.7rem;${on?'color:var(--txt)':'color:var(--mu);text-decoration:line-through'}`;
+    const sub=p.gps?`${p.points} GPS pts`:`${p.points||0} frame pts`;
     return `<div style="display:flex;align-items:center;gap:.3rem;margin-bottom:.25rem;cursor:pointer" onclick="toggleOnePath(${i})" title="Click to show/hide">
       ${dot}
       <span style="${nameStyle}" title="${p.name}">${p.name}</span>
+      <span style="font-size:.62rem;color:var(--mu);white-space:nowrap">${sub}</span>
       <button style="background:transparent;border:none;color:var(--mu);cursor:pointer;padding:0 .2rem;font-size:.82rem" onclick="event.stopPropagation();removeLoadedPath(${i})">✕</button>
     </div>`;
   }).join('');
@@ -227,27 +230,32 @@ function addPathFromSession(path, name){
   initMap();
   fetch('/api/session/records?path='+encodeURIComponent(path))
     .then(r=>r.json()).then(recs=>{
-      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null);
+      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null).sort((a,b)=>(a.t||0)-(b.t||0));
       if(!georecs.length) return;
+      const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps');
+      const pathrecs=gpsrecs.length?gpsrecs:georecs;
       const color=_PATH_COLORS[_loadedPaths.length%_PATH_COLORS.length];
       const on=_pathsVisible;
-      const layer=L.polyline(georecs.map(r=>[r.lat,r.lon]),
-        {color,opacity:.55,weight:2,dashArray:'6 4'});
+      const layer=L.polyline(pathrecs.map(r=>[r.lat,r.lon]),
+        {color,opacity:.55,weight:2,dashArray:gpsrecs.length?'':'6 4'});
       if(on) layer.addTo(map);
-      const dots=georecs.map(r=>{
-        const dot=L.circleMarker([r.lat,r.lon],{radius:4,color,fillColor:color,fillOpacity:.7,weight:1.2});
+      const dots=pathrecs.map(r=>{
+        const isGps=(r.record_type==='gps'||r.source==='gps');
+        const dot=L.circleMarker([r.lat,r.lon],{radius:isGps?3:4,color,fillColor:color,fillOpacity:.7,weight:1.2});
         const ts=r.t?new Date(r.t*1000).toISOString().slice(11,19):'?';
         const freq=r.freq?(r.freq/1e6).toFixed(0)+' MHz':'?';
         const coords=`<span style="font-family:monospace;font-size:.7rem;color:var(--mu)">${(+r.lat).toFixed(6)}, ${(+r.lon).toFixed(6)}</span>`;
-        const pop=`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
-          +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
-          +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
-          +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
+        const pop=isGps
+          ?`<b>GPS breadcrumb</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
+          :`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
+            +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
+            +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
+            +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
         dot.bindPopup(pop,{maxWidth:230,className:'aw-path-tip'});
         if(on) dot.addTo(map);
         return dot;
       });
-      _loadedPaths.push({name,path,color,layer,dots,visible:on});
+      _loadedPaths.push({name,path,color,layer,dots,visible:on,gps:gpsrecs.length,points:pathrecs.length});
       _renderPathsList();
     });
 }
@@ -556,7 +564,8 @@ function appendSolveLog(text){
 function startRun(){
   const cfg=document.getElementById('run-config').value;
   if(!cfg){alert('Select a config first.');return;}
-  fetch('/api/run/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})})
+  const log=!!document.getElementById('run-log-file')?.checked;
+  fetch('/api/run/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,log})})
     .then(()=>loadStatus());
 }
 function stopRun(){fetch('/api/run/stop',{method:'POST'}).then(()=>loadStatus());}
@@ -852,12 +861,12 @@ source = "software"
 [mode_config]
 channels = [1, 6, 11]
 hop_interval = 0.1
-output_path = "~/.aetherward/sessions/session.jsonl"
+# output_path omitted: runtime writes a timestamped file under ~/.aetherward/sessions
 store_raw_frames = true
 
 [output]
 format = "jsonl"
-path = "~/.aetherward/sessions/session.jsonl"
+path_policy = "default"
 `;
 
 function openNewCfg(){
@@ -902,8 +911,12 @@ function deleteCfg(name){
 
 // ── Wizard ────────────────────────────────────────────────────────────────────
 function openWizard(){
-  wStep=1; wizRenderProgress(); wizShowStep();
+  wStep=1;
+  const wn=document.getElementById('wiz-name');
+  if(wn && !wn.value.trim()) wn.value='my-config';
+  wizRenderProgress(); wizShowStep();
   document.getElementById('wiz-modal').classList.add('open');
+  if(wn) setTimeout(()=>wn.focus(),0);
   // if we already have cached detect data, use it immediately
   if(_detCache) _applyDetect(_detCache);
   // always refresh so the wizard shows current hardware state
@@ -933,10 +946,19 @@ function wizShowStep(){
   const isLast=wStep===STEPS;
   document.getElementById('wiz-next').style.display=isLast?'none':'';
   document.getElementById('wiz-save').style.display=isLast?'':'none';
-  if(wStep===5) wizShowAdvanced();
+  if(wStep===6) wizShowAdvanced();
   if(isLast) wizGenToml();
 }
 function wizNext(){
+  if(wStep===1){
+    const wn=document.getElementById('wiz-name');
+    const err=document.getElementById('wiz-name-err');
+    if(!wn || !wn.value.trim()){
+      if(err) err.style.display='block';
+      if(wn) wn.focus();
+      return;
+    }
+  }
   if(wStep<STEPS){wStep++;wizRenderProgress();wizShowStep();}
 }
 function wizPrev(){
@@ -949,6 +971,28 @@ function wizSetMode(m){
     if(el) el.classList.toggle('sel',k===m);
   });
   wizShowAdvanced();
+}
+
+function wizNameChanged(v){
+  const s=String(v||'').trim();
+  W.configName=s;
+  const err=document.getElementById('wiz-name-err');
+  if(err && s) err.style.display='none';
+  if(wStep===STEPS) wizGenToml();
+}
+
+function wizOutputPolicyChange(){
+  const sel=document.getElementById('wiz-output-policy');
+  const box=document.getElementById('wiz-output-custom');
+  const hint=document.getElementById('wiz-output-hint');
+  const policy=sel?.value||'default';
+  W.outputPolicy=policy;
+  if(box) box.style.display=policy==='custom'?'':'none';
+  if(hint){
+    if(policy==='default') hint.textContent='Default: create a new timestamped file in ~/.aetherward/sessions/ for every run.';
+    else if(policy==='custom') hint.textContent='Custom: use the exact file path below; repeated runs append to the same file.';
+    else hint.textContent='No file output: captures are not written as a session file.';
+  }
 }
 function wizShowAdvanced(){
   document.getElementById('wiz-adv-wardriver').style.display=    W.mode==='wardriver'?'':'none';
@@ -1014,10 +1058,14 @@ function wizPreset(i,k){
   document.getElementById('ant-customhi-'+i).style.display=k==='custom'?'flex':'none';
 }
 function wizGenToml(){
-  const name=document.getElementById('wiz-name').value||'my-config';
+  const name=(document.getElementById('wiz-name')?.value||W.configName||'my-config').trim()||'my-config';
   const gps=document.getElementById('wiz-gps').value;
   const sync=document.getElementById('wiz-sync-dev')?.value||'';
-  const out=document.getElementById('wiz-output').value||'~/.aetherward/sessions/session.jsonl';
+  const outPolicy=document.getElementById('wiz-output-policy')?.value||W.outputPolicy||'default';
+  const outInput=(document.getElementById('wiz-output')?.value||W.output||'').trim();
+  const useCustomOut=outPolicy==='custom';
+  const customOut=useCustomOut ? (outInput||`~/.aetherward/sessions/${name}.jsonl`) : '';
+  const fileOutput=outPolicy!=='none';
   const lines=[
     `# AetherWard configuration — generated by web wizard`,
     `array_id = "${name}"`,
@@ -1067,8 +1115,8 @@ function wizGenToml(){
     const chArr='['+ch.split(',').map(c=>c.trim()).filter(Boolean).join(', ')+']';
     lines.push(`channels = ${chArr}`);
     lines.push(`hop_interval = ${hop}`);
-    lines.push(`output_path = "${out}"`);
-    lines.push(`store_raw_frames = true`);
+    if(useCustomOut) lines.push(`output_path = "${customOut}"`);
+    if(fileOutput) lines.push(`store_raw_frames = true`);
   } else if(W.mode==='trilateration'){
     const refId=W.antennas[0]?.id||'wlan0';
     lines.push(`channel = ${triCh}`);
@@ -1085,12 +1133,17 @@ function wizGenToml(){
   }
   lines.push(``);
   lines.push(`[output]`);
-  lines.push(`format = "jsonl"`);
-  lines.push(`path = "${out}"`);
+  if(!fileOutput){
+    lines.push(`format = "none"`);
+  } else {
+    lines.push(`format = "jsonl"`);
+    if(useCustomOut) lines.push(`path = "${customOut}"`);
+    else lines.push(`path_policy = "default"`);
+  }
   document.getElementById('wiz-toml').value=lines.join('\n');
 }
 function wizSave(){
-  const name=document.getElementById('wiz-name').value.trim();
+  const name=(document.getElementById('wiz-name')?.value||'').trim();
   const content=document.getElementById('wiz-toml').value;
   const err=document.getElementById('wiz-err'); err.style.display='none';
   if(!name){err.textContent='Enter a config name.';err.style.display='block';return;}

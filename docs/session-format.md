@@ -1,8 +1,6 @@
 # Session format
 
-Sessions are newline-delimited JSON (`.jsonl`). One record per observation,
-appended as the session runs. All three mode types write to the same file; the
-web UI and `solve`/`process` commands detect the record type from the fields present.
+Sessions are newline-delimited JSON (`.jsonl`). The file is append-only as the session runs. Wardriving sessions contain observation records for captured frames and GPS breadcrumb records for the driven path. All mode types write to the same file; the web UI and `solve`/`process` commands detect the record type from the fields present.
 
 Sessions are plain text — open them with any editor, stream them with `tail -f`,
 or post-process with `jq`.
@@ -17,6 +15,8 @@ Written by `wardriver` mode for every captured and correlated frame.
 
 ```json
 {
+  "schema": "aetherward.session.v1",
+  "record_type": "observation",
   "t": 1716000000.123,
   "freq": 2412000000,
   "bw": 20000000,
@@ -41,6 +41,7 @@ Written by `wardriver` mode for every captured and correlated frame.
 
 | Field | Description |
 |-------|-------------|
+| `record_type` | `observation` for captured frame records; legacy files may omit it |
 | `id` / `bssid` | Source identifier / AP BSSID when known |
 | `ssid` | Human-readable name (when parseable from frame) |
 | `auth_mode` / `security` | Parsed AP security, WPA/WPA2/WPA3/OPEN/WEP when available |
@@ -51,6 +52,36 @@ Written by `wardriver` mode for every captured and correlated frame.
 | `lat` / `lon` | Observer GPS position at capture time |
 | `protocol` | Protocol string (`802.11`, `bt`, `lora`, etc.) |
 | `t` | Unix timestamp (float seconds) |
+
+### Wardriver GPS breadcrumb
+
+Written by `wardriver` mode at the GPS poll interval, independently of frame captures.
+These records let the web map display the real driven route even during quiet RF
+sections or temporary adapter stalls. Source solvers ignore them.
+
+```json
+{
+  "schema": "aetherward.session.v1",
+  "record_type": "gps",
+  "t": 1716000000.000,
+  "lat": 48.8566,
+  "lon": 2.3522,
+  "alt": 35.0,
+  "fix": 2,
+  "accuracy_h": 3.5,
+  "accuracy_v": 6.0,
+  "num_sats": 9
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `record_type` | Always `gps` |
+| `lat` / `lon` / `alt` | GPS receiver position |
+| `fix` | Numeric fix type from `AbsolutePosition.fix_type` |
+| `accuracy_h` / `accuracy_v` | GPS accuracy when supplied by the backend |
+| `num_sats` | Satellite count when supplied by the backend |
+| `t` | GPS fix timestamp, or wall-clock time if the backend did not provide one |
 
 ### TDOA / ENU position
 

@@ -1,6 +1,9 @@
-"""CLI commands: info, validate, config, process, run, solve, install."""
+"""CLI commands: info, validate, config, process, run, solve, session-check, install."""
 from __future__ import annotations
 
+import contextlib
+import os
+import re
 import shutil
 import signal
 import sys
@@ -10,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from cli.aetherward import (
-    AW_CONFIGS, AW_HOME, AW_SESSIONS,
+    AW_CONFIGS, AW_HOME, AW_LOGS, AW_SESSIONS,
     _TTY, _banner, _confirm, _dim, _ensure_home, _err, _hi, _lbl,
     _list_configs, _load_config_file, _ok, _path, _print_kv, _sep, _tick,
     _val,
@@ -131,7 +134,7 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None,
     """
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
-    from aetherward.session import record_get, record_source_id, source_meta_from_record
+    from aetherward.session import is_gps_record, record_get, record_source_id, source_meta_from_record
 
     # Accumulate per-source stats
     sources: dict = defaultdict(lambda: {
@@ -139,6 +142,8 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None,
     })
 
     for rec in records:
+        if is_gps_record(rec):
+            continue
         sid = record_source_id(rec)
         s   = sources[sid]
         s['count'] += 1
@@ -380,8 +385,11 @@ def _proc_tdoa_replay(records: list, config: str, fmt: str, out_path: str | None
 
     # Group records into TDOA groups: same freq bucket + timestamp window
     from collections import defaultdict
+    from aetherward.session import is_gps_record
     groups: dict = defaultdict(list)
     for rec in records:
+        if is_gps_record(rec):
+            continue
         freq   = rec.get('freq', 0)
         t      = rec.get('t', 0.0)
         bucket = int(t / correlation_window)
@@ -429,6 +437,45 @@ def _proc_tdoa_replay(records: list, config: str, fmt: str, out_path: str | None
     print(f'  {_ok("✓")} Written to {_path(dest)}')
 
 
+
+
+def _cmd_session_check(args) -> None:
+    """Sanity-check a JSONL session and optionally write a dumb raw map."""
+    from aetherward.session_sanity import (
+        default_output_path,
+        format_report,
+        load_session,
+        write_csv,
+        write_geojson,
+        write_html,
+    )
+
+    report = load_session(args.session)
+    print(format_report(report, details=getattr(args, 'details', False)), end='')
+
+    html_arg = getattr(args, 'html', None)
+    if html_arg is not None:
+        out = Path(html_arg).expanduser() if html_arg else default_output_path(args.session, '.sanity.html')
+        write_html(report, out)
+        print(f'  {_ok("✓")} Dumb HTML map written to {_path(str(out))}')
+
+    geojson_arg = getattr(args, 'geojson', None)
+    if geojson_arg is not None:
+        out = Path(geojson_arg).expanduser() if geojson_arg else default_output_path(args.session, '.sanity.geojson')
+        write_geojson(report, out)
+        print(f'  {_ok("✓")} Dumb GeoJSON written to {_path(str(out))}')
+
+    csv_arg = getattr(args, 'csv', None)
+    if csv_arg is not None:
+        out = Path(csv_arg).expanduser() if csv_arg else default_output_path(args.session, '.sanity.csv')
+        write_csv(report, out)
+        print(f'  {_ok("✓")} Geotagged CSV written to {_path(str(out))}')
+
+    if getattr(args, 'fail_on_error', False):
+        if any(i.severity == 'ERROR' for i in report.issues):
+            sys.exit(2)
+
+
 def _cmd_install() -> None:
     """Install the aetherward command to ~/.local/bin (or /usr/local/bin)."""
     import stat
@@ -469,6 +516,43 @@ def _cmd_uninstall() -> None:
     shutil.rmtree(AW_HOME)
     print(f'  {_ok("✓")} Removed.\n')
 
+
+class _Tee:
+    """Small stdout/stderr tee for optional per-run log files."""
+    def __init__(self, primary, log_file):
+        self._primary = primary
+        self._log_file = log_file
+
+    def write(self, data):
+        self._primary.write(data)
+        self._log_file.write(_strip_ansi_for_log(data))
+        return len(data)
+
+    def flush(self):
+        self._primary.flush()
+        self._log_file.flush()
+
+    def isatty(self):
+        return bool(getattr(self._primary, 'isatty', lambda: False)())
+
+
+def _strip_ansi_for_log(text: str) -> str:
+    return re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', text)
+
+
+def _safe_log_stem(value: str | os.PathLike | None) -> str:
+    raw = Path(value).stem if value else 'session'
+    raw = str(raw).strip() or 'session'
+    raw = re.sub(r'[^A-Za-z0-9_.-]+', '-', raw).strip('.-')
+    return raw or 'session'
+
+
+def _default_run_log_path(config: str) -> Path:
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    stem = _safe_log_stem(config)
+    return AW_LOGS / f'sessions-{stem}-{stamp}.log'
+
+
 def _load_backend(backend_str: str, backend_config: dict):
     """Dynamically import, instantiate, and initialise a hardware backend."""
     import importlib
@@ -496,7 +580,20 @@ def _load_backend(backend_str: str, backend_config: dict):
     return be
 
 
-def _run_session(config: str, mode_override: Optional[str]) -> None:
+def _run_session(config: str, mode_override: Optional[str], *,
+                 log_run: bool = False, log_file: Optional[str] = None) -> None:
+    if log_run or log_file:
+        path = Path(log_file).expanduser() if log_file else _default_run_log_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8', buffering=1) as fh:
+            print(f'  {_lbl("Run log")}  {_path(str(path))}')
+            fh.write(f'# AetherWard run log\n# config={config}\n# started={time.strftime("%Y-%m-%d %H:%M:%S")}\n\n')
+            with contextlib.redirect_stdout(_Tee(sys.stdout, fh)), contextlib.redirect_stderr(_Tee(sys.stderr, fh)):
+                return _run_session_impl(config, mode_override)
+    return _run_session_impl(config, mode_override)
+
+
+def _run_session_impl(config: str, mode_override: Optional[str]) -> None:
     try:
         import aetherward
         from aetherward import AntennaArray, Antenna, MODES
@@ -540,15 +637,30 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
                 print(f'  {_err("!")} {ac.id}: backend failed — {exc}', file=sys.stderr)
         array.add(ant)
 
-    gps_be = _init_gps(cfg, array)
+    # Wardriver owns GPS polling so it can write GPS breadcrumb records.
+    # Other modes keep the older external position-update loop.
+    gps_be = _init_gps(cfg, array, start_thread=(mode_name != 'wardriver'))
 
     # Inject a frame counter so the status loop can report activity.
     # [output].path is normalised by AWConfig, but keep a local fallback so
     # older config objects still make run sessions write files.
     _frame_count = [0]
     mc = dict(cfg.mode_config)
-    if 'output_path' not in mc and getattr(cfg, 'output', {}).get('path'):
-        mc['output_path'] = cfg.output['path']
+    output_cfg = dict(getattr(cfg, 'output', {}) or {})
+    output_fmt = str(output_cfg.get('format', 'jsonl')).lower()
+    if output_fmt in ('none', 'off', 'false', 'disabled'):
+        mc['output_enabled'] = False
+    else:
+        mc.setdefault('output_format', output_fmt)
+        if 'output_path' not in mc and output_cfg.get('path'):
+            mc['output_path'] = output_cfg['path']
+    if gps_be is not None and mode_name == 'wardriver':
+        mc['gps_backend'] = gps_be
+        try:
+            mc.setdefault('gps_interval', 1.0 if cfg.gps.backend == 'gpsd' else 2.0)
+        except Exception:
+            pass
+
     _orig_on_obs = mc.get('on_observation')
     def _count_frame(obs):
         _frame_count[0] += 1
@@ -561,6 +673,11 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
     print(f'\n  {_hi("▸")} mode={_val(mode_name)}  '
           f'array={_val(cfg.array_id)}  '
           f'antennas={_val(str(array.n))}')
+    out_path = mc.get('output_path')
+    if out_path:
+        print(f'  {_lbl("Session")}  {_path(str(out_path))}')
+    elif not mc.get('output_enabled', True):
+        print(f'  {_lbl("Session")}  {_dim("file output disabled")}')
     print(f'  {_dim("Ctrl-C to stop.")}\n')
 
     stopped = threading.Event()
@@ -578,8 +695,17 @@ def _run_session(config: str, mode_override: Optional[str]) -> None:
                 elapsed = int(now - t_start)
                 n_src   = len(mode.sources) if hasattr(mode, 'sources') else 0
                 pos     = array.absolute_position
-                gps_str = (f'{pos.lat:.5f},{pos.lon:.5f}'
-                           if pos and pos.is_valid() else 'no fix')
+                gps_max_age = float(mc.get('gps_max_age', 5.0))
+                gps_str = 'no fix'
+                if pos and pos.is_valid():
+                    ts = float(getattr(pos, 'timestamp', 0.0) or 0.0)
+                    age = max(0.0, now - ts) if ts > 0.0 else None
+                    if age is not None and age > gps_max_age:
+                        gps_str = f'stale age={age:.1f}s last={pos.lat:.5f},{pos.lon:.5f}'
+                    else:
+                        gps_str = f'{pos.lat:.5f},{pos.lon:.5f}'
+                        if age is not None:
+                            gps_str += f' age={age:.1f}s'
                 print(
                     f'  t={elapsed}s  frames={_frame_count[0]}'
                     f'  sources={n_src}  gps={gps_str}',
@@ -631,7 +757,7 @@ def _autostart_gpsd(host: str, port: int) -> None:
     print(f'  {_err("gpsd started but not yet reachable")} — connection will retry', file=sys.stderr)
 
 
-def _init_gps(cfg, array):
+def _init_gps(cfg, array, start_thread: bool = True):
     from aetherward.hardware.gps import (
         GPSDBackend, StaticGPSBackend,
         GeoclueBackend, MozillaLBSBackend, IPGeolocationBackend,
@@ -667,14 +793,52 @@ def _init_gps(cfg, array):
     label = gc.backend
     print(f'  {_ok("✓")} Position source: {_val(label)}')
 
+    if not start_thread:
+        return be
+
     def _loop():
+        last_warn = 0.0
+        max_age = float(getattr(cfg, 'mode_config', {}).get('gps_max_age', 5.0))
         while True:
+            now = time.time()
             try:
                 pos = be.get_position()
                 if pos and pos.is_valid():
-                    array.update_position(pos)
-            except Exception:
-                pass
+                    ts = float(getattr(pos, 'timestamp', 0.0) or 0.0)
+                    age = max(0.0, now - ts) if ts > 0.0 else 0.0
+                    if ts <= 0.0 or age <= max_age:
+                        array.update_position(pos)
+                    elif now - last_warn > 15.0:
+                        try:
+                            array.absolute_position = None
+                        except Exception:
+                            pass
+                        print(f'  {_err("!")} Position source stale fix ignored age={age:.1f}s max={max_age:.1f}s',
+                              file=sys.stderr, flush=True)
+                        last_warn = now
+                elif now - last_warn > 15.0:
+                    try:
+                        array.absolute_position = None
+                    except Exception:
+                        pass
+                    print(f'  {_err("!")} Position source returned no valid fix', file=sys.stderr, flush=True)
+                    last_warn = now
+                    # GPSDBackend sets its socket to None after an I/O error.
+                    # Try to reconnect instead of leaving the array position frozen forever.
+                    if getattr(be, '_sock', True) is None:
+                        try:
+                            be.initialize()
+                            print(f'  {_ok("✓")} Position source reconnected', flush=True)
+                        except Exception as exc:
+                            print(f'  {_err("!")} Position reconnect failed: {exc}', file=sys.stderr, flush=True)
+            except Exception as exc:
+                try:
+                    array.absolute_position = None
+                except Exception:
+                    pass
+                if now - last_warn > 15.0:
+                    print(f'  {_err("!")} Position source error: {exc}', file=sys.stderr, flush=True)
+                    last_warn = now
             time.sleep(poll_interval)
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -751,7 +915,7 @@ def _cmd_solve(args) -> None:
 
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
-    from aetherward.session import record_source_id, source_meta_from_record
+    from aetherward.session import is_gps_record, record_source_id, source_meta_from_record
 
     # Per-source state
     rss_obs  : dict = defaultdict(list)   # sid → [(lat, lon, rssi)]
@@ -805,6 +969,9 @@ def _cmd_solve(args) -> None:
                 except ValueError:
                     continue
                 new_n += 1
+
+                if is_gps_record(rec):
+                    continue
 
                 sid = record_source_id(rec)
 

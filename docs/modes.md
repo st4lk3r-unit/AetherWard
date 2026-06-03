@@ -6,14 +6,14 @@ AetherWard runs in one of three modes set by the `mode` key in your config.
 
 ## `wardriver`
 
-Scans one or more antennas across RF channels. Every captured frame is tagged with the current GPS position and written to a JSONL session file with parsed metadata and optional raw bytes. The RSS solver estimates source positions from RSSI measurements at multiple known observer locations.
+Scans one or more antennas across RF channels. Every captured frame is tagged with the current GPS position and written to a JSONL session file with parsed metadata and optional raw bytes. The mode also writes GPS breadcrumb records at the GPS poll interval, so the map can show the driven route even when no frames are captured. The RSS solver estimates source positions from RSSI measurements at multiple known observer locations.
 
 ### How it works
 
 1. Channels are assigned to antennas that cover the channel frequency; fallback assignment remains balanced with no overlap. A single-channel config is intentionally broadcast to all receivers.
 2. Frames are grouped into `SignalSource` objects by `(frequency, identifier)`, where identifier is BSSID, MAC, or device ID extracted from the protocol header.
 3. Anonymous frames (no parseable identifier) are bucketed by frequency + 1-second time window.
-4. GPS is polled on a configurable interval; each observation snapshot includes the fix at capture time.
+4. GPS is polled on a configurable interval; each observation snapshot includes the fix at capture time, and a separate `record_type = "gps"` breadcrumb is appended for the road/path trace.
 
 ### Config keys
 
@@ -21,7 +21,7 @@ Scans one or more antennas across RF channels. Every captured frame is tagged wi
 |-----|------|---------|-------------|
 | `channels` | `list[int]` | 1–13 | Channels to scan |
 | `hop_interval` | `float` | `0.1` | Seconds per channel dwell |
-| `output_path` | `string` | — | JSONL session output path; falls back to `[output].path` |
+| `output_path` | `string` | timestamped file in `~/.aetherward/sessions/` | JSONL session output path; falls back to `[output].path`, then to the default sessions folder |
 | `store_raw_frames` | `bool` | `true` | Store raw frame bytes as `raw_frame_hex`/`raw_frame_b64` |
 
 ### RSS solver

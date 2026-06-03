@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from aetherward.session import default_session_path
+
 
 @dataclass
 class AntennaConfig:
@@ -68,8 +70,21 @@ class AWConfig:
         # Keep the user-facing [output] table authoritative for saved runs,
         # while preserving backward compatibility with older configs that put
         # the path directly under [mode_config].
+        #
+        # If no path is configured for wardriving, enable the default session
+        # folder instead of silently running without a JSONL writer.  Explicit
+        # output.format = "none" remains the opt-out.
+        out_fmt = str(cfg.output.get('format', 'jsonl')).lower()
         if 'output_path' not in cfg.mode_config and cfg.output.get('path'):
             cfg.mode_config['output_path'] = cfg.output['path']
+        elif (
+            cfg.mode == 'wardriver'
+            and 'output_path' not in cfg.mode_config
+            and out_fmt not in ('none', 'off', 'false', 'disabled')
+        ):
+            cfg.mode_config['output_path'] = default_session_path(cfg.array_id, cfg.mode)
+            cfg.output.setdefault('format', 'jsonl')
+            cfg.output.setdefault('path', cfg.mode_config['output_path'])
 
         return cfg
 
