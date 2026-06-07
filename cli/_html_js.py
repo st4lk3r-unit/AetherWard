@@ -1,6 +1,10 @@
 _HTML_JS = r"""<script>
 // ── State ─────────────────────────────────────────────────────────────────────
 const srcs = {}, mkrs = {};
+const _relLines = {}, _sampleLines = [];
+const _sourceSamples = {}, _sourceSamplesByAp = {};
+const _networkRelations = {};
+const _sourceSampleFetches = {};
 let map = null, totalUpd = 0;
 const STEPS = 7;
 let wStep = 1;
@@ -40,7 +44,7 @@ function tab(btn) {
   const name = btn.dataset.tab;
   document.getElementById('panel-'+name).classList.add('active');
   btn.classList.add('active');
-  if (name==='map')       { initMap(); if(map) map.invalidateSize(); refreshMapCount(); _renderPathsList(); _updatePathsToggleBtn(); }
+  if (name==='map')       { initMap(); if(map) map.invalidateSize(); refreshMapStats(); _renderPathsList(); _updatePathsToggleBtn(); }
   if (name==='positions') renderPositions();
   if (name==='enu')       { requestAnimationFrame(enuRender); }
   if (name==='tdoa3d')    { loadConfigs(); requestAnimationFrame(tdoa3dRender); }
@@ -61,6 +65,7 @@ function tab(btn) {
 // ── Map ───────────────────────────────────────────────────────────────────────
 // ── Map filter state ──────────────────────────────────────────────────────────
 let _mapFilter='all';
+let _mapRoleFilter='all', _mapShowRelations=true, _selectedSourceId=null;
 const _PATH_COLORS=['#ff3c3c','#3c9eff','#3cff6e','#ffcc3c','#cc3cff','#ff3c8e','#ff8c3c','#3cffee'];
 let _loadedPaths=[];
 
@@ -68,6 +73,16 @@ function _updateMapCenter(){
   if(!map) return;
   const c=map.getCenter(), el=document.getElementById('map-center');
   if(el) el.textContent=c.lat.toFixed(6)+',  '+c.lng.toFixed(6);
+}
+function _pointInCurrentView(lat, lon){
+  if(!map||lat==null||lon==null) return false;
+  try{return map.getBounds().contains([+lat,+lon]);}catch(e){return false;}
+}
+function _sourceShownInCurrentView(rec){
+  if(!map||!rec||!rec.lat||!rec.lon) return false;
+  const id=String(rec.id||rec.bssid||'?');
+  const mk=mkrs[id];
+  return !!(mk&&map.hasLayer(mk)&&_pointInCurrentView(rec.lat,rec.lon));
 }
 const _TILE_SOURCES = {
   'CartoDB Dark':   {url:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',    opts:{subdomains:'abcd',maxZoom:19,attribution:'&copy; <a href="https://openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'}},
@@ -88,18 +103,115 @@ function initMap() {
   map = L.map('map',{preferCanvas:true}).setView([48.8566,2.3522],13);
   const saved = localStorage.getItem('aw_tile') || 'CartoDB Dark';
   _switchTile(Object.keys(_TILE_SOURCES).includes(saved) ? saved : 'CartoDB Dark');
+  // Keep network relation overlays above route/path polylines but below markers.
+  // Otherwise AP↔client links can be visually swallowed by route previews.
+  if(!map.getPane('aw-relations')){
+    map.createPane('aw-relations');
+    map.getPane('aw-relations').style.zIndex = 455;
+  }
+  if(!map.getPane('aw-samples')){
+    map.createPane('aw-samples');
+    map.getPane('aw-samples').style.zIndex = 460;
+  }
   map.on('move',_updateMapCenter);
+  map.on('moveend zoomend',()=>{_refreshRelationshipLines();refreshMapStats();});
+  map.on('click',_clearSampleLines);
   _updateMapCenter();
   Object.values(srcs).forEach(updateMarker);
+  _refreshRelationshipLines();
   // Activate saved button after DOM is ready
   document.querySelectorAll('.tile-btn').forEach(b => b.classList.toggle('tile-btn-active', b.dataset.tile === saved));
 }
 function mkColor(m){return m==='tdoa'?'#ff3c3c':m==='rssi_centroid'?'#f0c040':m==='manual'?'#706082':'#60a5fa'}
-function mkIcon(m){
-  const c=mkColor(m);
+function _normId(v){return String(v||'').trim().toLowerCase();}
+function _badId(v){v=_normId(v);return !v||v==='ff:ff:ff:ff:ff:ff'||v==='00:00:00:00:00:00'||v==='none'||v==='null';}
+function _cleanSSID(v){return String(v||'').trim().toLowerCase()==='defaultssid'?'':v;}
+function _displaySSID(v){v=_cleanSSID(v);return (v==null||String(v)==='')?'<empty SSID>':String(v);}
+function _firstSpecificRecVal(rec, keys){
+  for(const k of keys){const v=_directRecVal(rec,k); if(v!=null&&v!==''&&!(Array.isArray(v)&&!v.length)) return v;}
+  return undefined;
+}
+function _boolish(v){return v===true||v===1||v==='1'||String(v).toLowerCase()==='true';}
+const _REC_ALIASES={
+  associated_bssid:['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap'],
+  linked_client:['linked_client','linked_station','associated_client','client','station','sta'],
+  bssid:['bssid','associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap'],
+  client:['client','station','sta','linked_client'],
+  station:['station','client','sta','linked_client'],
+  source_role:['source_role','role','kind'],
+  id:['id','identifier','mac','bssid','client','station'],
+  identifier:['identifier','id','mac','bssid','client','station'],
+};
+function _directRecVal(rec,k){
+  if(!rec) return undefined;
+  if(rec[k]!=null&&rec[k]!==''&&!(Array.isArray(rec[k])&&!rec[k].length)) return rec[k];
+  const m=rec.metadata||{};
+  if(m[k]!=null&&m[k]!==''&&!(Array.isArray(m[k])&&!m[k].length)) return m[k];
+  return undefined;
+}
+function _recVal(rec,k){
+  const keys=_REC_ALIASES[k]||[k];
+  for(const kk of keys){
+    const v=_directRecVal(rec,kk);
+    if(v!=null&&v!==''&&!(Array.isArray(v)&&!v.length)) return v;
+  }
+  return undefined;
+}
+function _srcRole(rec){
+  const r=String(_recVal(rec,'source_role')||_recVal(rec,'role')||_recVal(rec,'kind')||'').toLowerCase();
+  if(['ap','access_point','access-point'].includes(r)) return 'ap';
+  if(['client','station','sta'].includes(r)) return 'client';
+  const st=String(_recVal(rec,'frame_subtype')||'').toLowerCase();
+  if(st==='beacon'||st==='probe_resp') return 'ap';
+  const assoc=_firstSpecificRecVal(rec,['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap']);
+  const directClient=_directRecVal(rec,'client')||_directRecVal(rec,'station')||_directRecVal(rec,'sta');
+  if(st==='probe_req'||assoc||directClient) return 'client';
+  const linked=_firstSpecificRecVal(rec,['linked_client','linked_station','associated_client']);
+  if(linked) return 'ap';
+  const id=_normId(_directRecVal(rec,'id')||_directRecVal(rec,'identifier'));
+  const bssid=_normId(_directRecVal(rec,'bssid'));
+  if(id&&bssid&&id!==bssid) return 'client';
+  if(id&&bssid&&id===bssid) return 'ap';
+  if((_cleanSSID(rec.ssid)||rec.auth_mode||rec.security)&&bssid) return 'ap';
+  return 'unknown';
+}
+function _roleColor(role){return role==='ap'?'#a855f7':role==='client'?'#00d4c8':'#706082';}
+function _roleLabel(role){return role==='ap'?'AP':role==='client'?'Client':'Other';}
+function _sourcePrimaryId(rec){return _normId(_directRecVal(rec,'id')||_directRecVal(rec,'identifier')||_directRecVal(rec,'client')||_directRecVal(rec,'station')||_directRecVal(rec,'bssid'));}
+function _apIdFor(rec){
+  const id=_sourcePrimaryId(rec);
+  let ap=_normId(_firstSpecificRecVal(rec,['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap']));
+  if(ap&&ap!==id&&!_badId(ap)) return ap;
+  // For client-originated data frames, bssid is often the AP.  Use it only as
+  // a guarded fallback when it is not the source itself.
+  const bssid=_normId(_directRecVal(rec,'bssid'));
+  if(_srcRole(rec)==='client'&&bssid&&bssid!==id&&!_badId(bssid)) return bssid;
+  return '';
+}
+function _candidateIds(rec){
+  return [_directRecVal(rec,'id'),_directRecVal(rec,'identifier'),_directRecVal(rec,'bssid'),_directRecVal(rec,'client'),_directRecVal(rec,'station'),_directRecVal(rec,'mac')]
+    .map(_normId).filter(v=>v&&!_badId(v));
+}
+function _findSourceByMac(mac, wantRole){
+  const n=_normId(mac); if(!n||_badId(n)) return null;
+  let unknown=null;
+  for(const rec of Object.values(srcs)){
+    const role=_srcRole(rec);
+    const ids=_candidateIds(rec);
+    if(ids.includes(n)){
+      if(!wantRole||role===wantRole) return rec;
+      if(role==='unknown') unknown=unknown||rec;
+    }
+  }
+  return unknown;
+}
+function mkIcon(rec, selected=false){
+  const method=mkColor(rec?.pos_method), role=_srcRole(rec), fill=_roleColor(role);
+  const ap=role==='ap', sz=selected?18:(ap?15:13), r=ap?'4px':'50%';
+  const pulse=selected?`box-shadow:0 0 0 3px rgba(255,60,60,.38),0 0 14px ${fill}cc`:`box-shadow:0 0 8px ${fill}88`;
   return L.divIcon({className:'',
-    html:`<div style="width:13px;height:13px;border-radius:50%;background:${c};border:2px solid ${c}66;box-shadow:0 0 8px ${c}88"></div>`,
-    iconSize:[13,13],iconAnchor:[6,6]});
+    html:`<div title="${_roleLabel(role)}" style="width:${sz}px;height:${sz}px;border-radius:${r};background:${fill};border:2px solid ${method};${pulse}"></div>`,
+    iconSize:[sz,sz],iconAnchor:[Math.round(sz/2),Math.round(sz/2)]});
 }
 
 let _mapSearchSSID='', _mapSearchMAC='', _mapSearchRadius=0, _mapSearchCenter=null;
@@ -111,8 +223,13 @@ function _haversine(lat1,lon1,lat2,lon2){
 }
 function _markerVisible(rec){
   if(_mapFilter!=='all'&&_mapFilter!==rec.pos_method) return false;
+  if(_mapRoleFilter!=='all'&&_mapRoleFilter!==_srcRole(rec)) return false;
   if(_mapSearchSSID&&!(rec.ssid||'').toLowerCase().includes(_mapSearchSSID.toLowerCase())) return false;
-  if(_mapSearchMAC&&!(rec.id||'').toLowerCase().includes(_mapSearchMAC.toLowerCase())) return false;
+  if(_mapSearchMAC){
+    const q=_mapSearchMAC.toLowerCase();
+    const hay=['id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(rec,k)||'').toLowerCase()).join(' ');
+    if(!hay.includes(q)) return false;
+  }
   if(_mapSearchRadius>0&&_mapSearchCenter&&rec.lat&&rec.lon){
     if(_haversine(_mapSearchCenter.lat,_mapSearchCenter.lon,rec.lat,rec.lon)>_mapSearchRadius) return false;
   }
@@ -124,7 +241,9 @@ function applyMapFilters(){
     const rec=srcs[id]; if(!rec) return;
     if(_markerVisible(rec)) mk.addTo(map); else mk.remove();
   });
-  refreshMapCount();
+  _refreshRelationshipLines();
+  if(_selectedSourceId) _showSourceSamples(_selectedSourceId);
+  refreshMapStats();
 }
 function setRadiusCenter(){
   if(!map){alert('Open the Map tab first.');return;}
@@ -134,49 +253,353 @@ function setRadiusCenter(){
   if(btn){btn.style.color='var(--acc)';btn.style.borderColor='var(--acc)';}
   applyMapFilters();
 }
+
+let _mapSearchHydrateTimer=null;
+const _mapSearchHydrated={};
+function mapMacSearchChanged(v){
+  _mapSearchMAC=String(v||'').trim();
+  applyMapFilters();
+  if(_mapSearchHydrateTimer) clearTimeout(_mapSearchHydrateTimer);
+  _mapSearchHydrateTimer=setTimeout(_hydrateMapSearchSource,280);
+}
+function _looksLikeSourceQuery(q){
+  q=String(q||'').trim().toLowerCase();
+  if(!q) return false;
+  if(q.includes(':')||q.includes('-')) return q.replace(/[^0-9a-f]/g,'').length>=6;
+  return q.length>=8;
+}
+function _rowsToSearchSourceRecord(q, rows){
+  rows=(rows||[]).filter(r=>r&&r.lat!=null&&r.lon!=null);
+  if(!rows.length) return null;
+  const id=_normId(q);
+  const first=rows.find(r=>String(_cleanSSID(r.ssid)||'').trim())||rows[0];
+  let sw=0, lat=0, lon=0, best=rows[0];
+  rows.forEach(r=>{
+    const w=Math.max(1, Math.min(80, 110+(Number(r.rssi??-85))));
+    sw+=w; lat+=(+r.lat)*w; lon+=(+r.lon)*w;
+    if((r.rssi??-999)>(best.rssi??-999)) best=r;
+  });
+  if(!sw){lat=best.lat;lon=best.lon;} else {lat/=sw;lon/=sw;}
+  const meta=first.metadata||{};
+  const rec={...meta,...first,id:id||String(first.id||first.bssid||q),identifier:id||String(first.id||q),
+    lat,lon,t:best.t||first.t||0,rssi:best.rssi??first.rssi,
+    samples:first.sampled_total||rows.length,raw_samples:first.sampled_total||rows.length,
+    pos_method:'session_sample_centroid',source_role:first.source_role||meta.source_role||first.role||meta.role||undefined};
+  if(!rec.ssid) rec.ssid=first.ssid||meta.ssid||'';
+  if(!rec.protocol) rec.protocol=first.protocol||meta.protocol||'';
+  return rec;
+}
+function _hydrateMapSearchSource(){
+  const q=String(_mapSearchMAC||'').trim();
+  const key=_normId(q);
+  if(!key||!_looksLikeSourceQuery(q)||!_loadedPaths.length) return;
+  if(_mapSearchHydrated[key]==='loading'||_mapSearchHydrated[key]==='done') return;
+  // If the source is already present in solved markers, filtering was enough.
+  const already=Object.values(srcs).some(r=>{
+    const hay=['id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(r,k)||'').toLowerCase()).join(' ');
+    return hay.includes(key);
+  });
+  if(already) return;
+  _mapSearchHydrated[key]='loading';
+  const paths=[...new Set(_loadedPaths.map(p=>p.path).filter(Boolean))];
+  let all=[];
+  let chain=Promise.resolve();
+  paths.forEach(path=>{
+    chain=chain.then(()=>{
+      const u='/api/session/source_samples?path='+encodeURIComponent(path)+'&source='+encodeURIComponent(q)+'&role=&max_obs=800';
+      return fetch(u).then(r=>r.json()).then(rows=>{
+        if(Array.isArray(rows)&&rows.length){
+          _indexSamplesFromRecords(path+'#search:'+key,rows,{replace:true});
+          all=all.concat(rows);
+        }
+      }).catch(()=>{});
+    });
+  });
+  chain.finally(()=>{
+    _mapSearchHydrated[key]='done';
+    const rec=_rowsToSearchSourceRecord(q, all);
+    if(rec){
+      srcs[rec.id]=rec;
+      updateMarker(rec);
+      sysLog('Hydrated searched source from loaded session paths: '+rec.id+' ('+(rec.samples||all.length)+' sample records)');
+      applyMapFilters();
+    } else {
+      refreshMapStats();
+    }
+  });
+}
+
+function _recordSourceId(r){
+  const m=r.metadata||{};
+  return String(r.id||r.identifier||m.identifier||m.id||m.bssid||m.station||m.client||r.bssid||r.station||r.client||r.mac||m.mac||'');
+}
+function _recordApId(r){
+  const ap=_normId(_firstSpecificRecVal(r,['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap']));
+  const sid=_normId(_recordSourceId(r));
+  if(ap&&ap!==sid&&!_badId(ap)) return ap;
+  const bssid=_normId(_directRecVal(r,'bssid'));
+  if(bssid&&bssid!==sid&&!_badId(bssid)) return bssid;
+  return '';
+}
+function _addSampleIndex(key, sample){
+  key=_normId(key); if(!key||_badId(key)) return;
+  (_sourceSamples[key]||= []).push(sample);
+}
+function _relationPairsFromRecord(r){
+  const pairs=[];
+  const sid=_normId(_recordSourceId(r));
+  const role=_srcRole(r);
+  const add=(client,ap)=>{
+    client=_normId(client); ap=_normId(ap);
+    if(_badId(client)||_badId(ap)||client===ap) return;
+    pairs.push({client,ap});
+  };
+  const ap=_apIdFor(r);
+  if(role==='client'&&ap) add(sid,ap);
+  const linked=_normId(_firstSpecificRecVal(r,['linked_client','linked_station','associated_client']));
+  if(role==='ap'&&linked) add(linked,sid);
+
+  // Infer infrastructure relations directly from 802.11 address roles when
+  // the capture preserved addr1/addr2/addr3 and DS flags.
+  const a1=_normId(_directRecVal(r,'addr1'));
+  const a2=_normId(_directRecVal(r,'addr2'));
+  const a3=_normId(_directRecVal(r,'addr3'));
+  const to=_boolish(_recVal(r,'to_ds')), from=_boolish(_recVal(r,'from_ds'));
+  const st=String(_recVal(r,'frame_subtype')||'').toLowerCase();
+  if(to&&!from) add(a2,a1);
+  else if(from&&!to) add(a1,a2);
+  else if(['assoc_req','reassoc_req','association_req','reassociation_req'].includes(st)) add(a2,a1||a3);
+  else if(['assoc_resp','reassoc_resp','association_resp','reassociation_resp'].includes(st)) add(a1,a2||a3);
+  return pairs;
+}
+function _relationKey(client,ap){return [_normId(client),_normId(ap)].join('->');}
+function _indexRelationsFromRecords(path,recs){
+  Object.keys(_networkRelations).forEach(k=>{_networkRelations[k]=(_networkRelations[k]||[]).filter(x=>x.path!==path&&!String(x.path||'').startsWith(path+'#')); if(!_networkRelations[k].length) delete _networkRelations[k];});
+  recs.forEach((r,i)=>{
+    _relationPairsFromRecord(r).forEach(pair=>{
+      const key=_relationKey(pair.client,pair.ap);
+      (_networkRelations[key]||=[]).push({path,client:pair.client,ap:pair.ap,idx:i});
+    });
+  });
+}
+function _indexSamplesFromRecords(path,recs,opts){
+  opts=opts||{};
+  const replace=opts.replace!==false;
+  // Rebuild only entries for this path, so reloading a session does not double-count dots.
+  if(replace){
+    for(const bucket of [_sourceSamples,_sourceSamplesByAp]){
+      Object.keys(bucket).forEach(k=>{bucket[k]=(bucket[k]||[]).filter(s=>s.path!==path&&!String(s.path||'').startsWith(path+'#')); if(!bucket[k].length) delete bucket[k];});
+    }
+  }
+  recs.forEach((r,i)=>{
+    if((r.record_type==='gps'||r.source==='gps')||r.lat==null||r.lon==null) return;
+    const sample={path,lat:+r.lat,lon:+r.lon,t:r.t||0,rssi:r.rssi??null,idx:i};
+    const sid=_recordSourceId(r);
+    _addSampleIndex(sid,sample);
+    const ap=_recordApId(r);
+    if(ap) (_sourceSamplesByAp[ap]||=[]).push(sample);
+  });
+  _indexRelationsFromRecords(path,recs);
+}
+function _uniqSamples(samples){
+  const seen=new Set(), out=[];
+  samples.forEach(s=>{
+    const k=[s.path,(+s.lat).toFixed(7),(+s.lon).toFixed(7),Math.round((s.t||0)*1000),s.idx].join('|');
+    if(!seen.has(k)){seen.add(k);out.push(s);}
+  });
+  return out;
+}
+function _baseSamplePath(path){
+  return String(path||'').split('#')[0];
+}
+function _colorForSamplePath(path){
+  const base=_baseSamplePath(path);
+  const hit=_loadedPaths.find(p=>p.path===base);
+  return hit?.color || '#ff2020';
+}
+function _samplesForSource(rec){
+  if(!rec) return [];
+  const id=_sourcePrimaryId(rec);
+  let arr=[...(_sourceSamples[id]||[])];
+  if(_srcRole(rec)==='ap'){
+    for(const k of _candidateIds(rec)) arr=arr.concat(_sourceSamplesByAp[k]||[]);
+  }
+  return _uniqSamples(arr);
+}
+function _clearSampleLines(){
+  _sampleLines.splice(0).forEach(l=>l.remove());
+  _selectedSourceId=null;
+  Object.entries(mkrs).forEach(([id,m])=>{const rec=srcs[id]; if(rec)m.setIcon(mkIcon(rec,false));});
+  const stat=document.getElementById('map-link-count'); if(stat) stat.textContent='No selected source';
+  refreshMapStats();
+}
+function _updateSelectedSampleStat(){
+  const stat=document.getElementById('map-link-count'); if(!stat) return;
+  if(!_selectedSourceId){stat.textContent='No selected source';return;}
+  const rec=srcs[_selectedSourceId];
+  if(!rec){stat.textContent='No selected source';return;}
+  const key=_sourcePrimaryId(rec);
+  const samples=_samplesForSource(rec);
+  const inView=samples.filter(s=>_pointInCurrentView(s.lat,s.lon)).length;
+  if(samples.length) stat.textContent=`${inView}/${samples.length} selected sample link${samples.length!==1?'s':''} in view`;
+  else if(_sourceSampleFetches[key]==='loading') stat.textContent='Loading linked samples…';
+  else stat.textContent='No linked samples loaded';
+}
+function _drawSourceSampleLines(id){
+  _sampleLines.splice(0).forEach(l=>l.remove());
+  const rec=srcs[id];
+  if(!rec||!rec.lat||!rec.lon||!_markerVisible(rec)){_clearSampleLines();return;}
+  Object.entries(mkrs).forEach(([mid,m])=>{const r=srcs[mid]; if(r)m.setIcon(mkIcon(r,mid===id));});
+  const samples=_samplesForSource(rec);
+  samples.forEach(s=>{
+    const color=_colorForSamplePath(s.path);
+    const line=L.polyline([[rec.lat,rec.lon],[s.lat,s.lon]],{pane:'aw-samples',color,weight:1.6,opacity:.68,interactive:false}).addTo(map);
+    const dot=L.circleMarker([s.lat,s.lon],{pane:'aw-samples',radius:3,color,fillColor:color,fillOpacity:.9,weight:1,interactive:false}).addTo(map);
+    _sampleLines.push(line,dot);
+  });
+  _updateSelectedSampleStat();
+  refreshMapStats();
+}
+function _loadSamplesForSource(id,rec){
+  const key=_sourcePrimaryId(rec)||_normId(id);
+  if(!key||_sourceSampleFetches[key]==='loading'||_sourceSampleFetches[key]==='done') return Promise.resolve();
+  const paths=[...new Set(_loadedPaths.map(p=>p.path).filter(Boolean))];
+  if(!paths.length) return Promise.resolve();
+  _sourceSampleFetches[key]='loading';
+  _updateSelectedSampleStat();
+  const role=_srcRole(rec);
+  let chain=Promise.resolve();
+  paths.forEach(path=>{
+    chain=chain.then(()=>{
+      const u='/api/session/source_samples?path='+encodeURIComponent(path)+'&source='+encodeURIComponent(key)+'&role='+encodeURIComponent(role)+'&max_obs=1500';
+      return fetch(u).then(r=>r.json()).then(rows=>{
+        if(Array.isArray(rows)&&rows.length){
+          _indexSamplesFromRecords(path+'#samples:'+key,rows,{replace:true});
+          _refreshRelationshipLines();
+        }
+      }).catch(()=>{});
+    });
+  });
+  return chain.finally(()=>{_sourceSampleFetches[key]='done'; if(_selectedSourceId===id)_drawSourceSampleLines(id);});
+}
+function _showSourceSamples(id){
+  if(!map) return;
+  const rec=srcs[id];
+  if(!rec||!rec.lat||!rec.lon||!_markerVisible(rec)){_clearSampleLines();return;}
+  _selectedSourceId=id;
+  _drawSourceSampleLines(id);
+  if(!_samplesForSource(rec).length) _loadSamplesForSource(id,rec);
+}
+function _visibleSourceRec(rec){
+  return !!(rec&&rec.lat!=null&&rec.lon!=null&&_markerVisible(rec)&&_sourceShownInCurrentView(rec));
+}
+function _relationIdFor(rec){
+  return _normId(_recVal(rec,'id')||_recVal(rec,'identifier')||_recVal(rec,'bssid')||_recVal(rec,'client')||_recVal(rec,'station'));
+}
+function _addRelationLine(keep, a, b, label){
+  if(!map||!_visibleSourceRec(a)||!_visibleSourceRec(b)) return;
+  const aid=_relationIdFor(a), bid=_relationIdFor(b);
+  if(!aid||!bid||aid===bid) return;
+  const key=[aid,bid].sort().join('<>');
+  keep.add(key);
+  const latlngs=[[a.lat,a.lon],[b.lat,b.lon]];
+  if(_relLines[key]) _relLines[key].setLatLngs(latlngs);
+  else _relLines[key]=L.polyline(latlngs,{pane:'aw-relations',color:'#ff8c42',weight:2.2,opacity:.88,dashArray:'5 5',interactive:false}).addTo(map);
+  try{_relLines[key].bringToFront();}catch(e){}
+}
+function _refreshRelationshipLines(){
+  if(!map) return;
+  const keep=new Set();
+  if(_mapShowRelations){
+    Object.entries(srcs).forEach(([sid,rec])=>{
+      _relationPairsFromRecord(rec).forEach(pair=>{
+        const client=_findSourceByMac(pair.client,'client');
+        const ap=_findSourceByMac(pair.ap,'ap');
+        if(client&&ap) _addRelationLine(keep, client, ap, 'traffic');
+      });
+    });
+    Object.values(_networkRelations).forEach(list=>{
+      (list||[]).forEach(pair=>{
+        const client=_findSourceByMac(pair.client,'client');
+        const ap=_findSourceByMac(pair.ap,'ap');
+        if(client&&ap) _addRelationLine(keep, client, ap, 'indexed');
+      });
+    });
+  }
+  Object.keys(_relLines).forEach(k=>{if(!keep.has(k)){_relLines[k].remove();delete _relLines[k];}});
+  refreshMapStats();
+}
+function setMapRoleFilter(btn){
+  _mapRoleFilter=btn.dataset.role;
+  document.querySelectorAll('.mfpill-role').forEach(b=>b.classList.toggle('active',b===btn));
+  applyMapFilters();
+}
+function toggleMapRelations(btn){
+  _mapShowRelations=!_mapShowRelations;
+  if(btn){btn.textContent=_mapShowRelations?'Relations ●':'Relations ○';btn.style.opacity=_mapShowRelations?'1':'.5';}
+  _refreshRelationshipLines();
+}
 function updateMarker(rec){
   if(!map||!rec.lat||!rec.lon)return;
-  const id=String(rec.id||rec.bssid||'?'), lbl=String(rec.ssid||id||'?').slice(0,36);
+  const id=String(rec.id||rec.bssid||'?'), lbl=_displaySSID(rec.ssid||'').slice(0,36);
+  const role=_srcRole(rec), roleTxt=_roleLabel(role), apId=_apIdFor(rec);
   const res=rec.residual_dBm!=null?`<span style="color:var(--ylw)">Residual:</span> ${rec.residual_dBm} dB<br>`:
-            rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${(+rec.residual_m).toFixed(2)} m<br>`:'';
+            rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${(+rec.residual_m).toFixed(2)} m<br>`:
+            rec.rss_residual!=null?`<span style="color:var(--ylw)">Residual:</span> ${rec.rss_residual} dB<br>`:'';
+  rec.ssid=_cleanSSID(rec.ssid);
   const sec=rec.auth_mode||rec.security||'';
   const ch=rec.channel?` &nbsp; <span style="color:var(--mu)">Ch:</span> ${_xmlEsc(rec.channel)}`:'';
-  const bssid=rec.bssid&&rec.bssid!==id?`<span style="color:var(--mu)">BSSID:</span> ${_xmlEsc(rec.bssid)}<br>`:'';
+  const bssid=rec.bssid&&rec.bssid!==id?`<span style="color:var(--mu)">BSSID/AP:</span> ${_xmlEsc(rec.bssid)}<br>`:'';
+  const linkedClient=_recVal(rec,'linked_client');
+  const rel=role==='client'&&apId?`<span style="color:var(--mu)">Linked AP:</span> ${_xmlEsc(apId)}<br>`:
+            linkedClient?`<span style="color:var(--mu)">Linked client:</span> ${_xmlEsc(linkedClient)}<br>`:'';
+  const samples=_samplesForSource(rec).length;
   const detail=[
+    `<span style="color:var(--mu)">Role:</span> <b style="color:${_roleColor(role)}">${roleTxt}</b><br>`,
     sec?`<span style="color:var(--mu)">Auth:</span> <b>${_xmlEsc(sec)}</b><br>`:'',
     rec.protocol?`<span style="color:var(--mu)">Protocol:</span> ${_xmlEsc(rec.protocol)}<br>`:'',
     rec.frame_subtype?`<span style="color:var(--mu)">Frame:</span> ${_xmlEsc(rec.frame_subtype)}<br>`:'',
     Array.isArray(rec.akm_suites)&&rec.akm_suites.length?`<span style="color:var(--mu)">AKM:</span> ${_xmlEsc(rec.akm_suites.join(', '))}<br>`:'',
     Array.isArray(rec.pairwise_ciphers)&&rec.pairwise_ciphers.length?`<span style="color:var(--mu)">Cipher:</span> ${_xmlEsc(rec.pairwise_ciphers.join(', '))}<br>`:'',
   ].join('');
-  const pop=`<b>${_xmlEsc(lbl)}</b><br><small style="color:var(--mu)">${_xmlEsc(id)}</small><br>${bssid}
+  const pop=`<b>${_xmlEsc(lbl)}</b><br><small style="color:var(--mu)">${_xmlEsc(id)}</small><br>${bssid}${rel}${detail}
     <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${_xmlEsc(rec.pos_method||'?')}</b><br>
     ${(+rec.lat).toFixed(6)}, ${(+rec.lon).toFixed(6)}<br>
     <span style="color:var(--mu)">Samples:</span> ${rec.samples||'?'} &nbsp;
-    <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz${ch}<br>${detail}${res}
-    <a href="#" onclick="hideSource('${esc(id)}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
-  if(mkrs[id]){mkrs[id].setLatLng([rec.lat,rec.lon]).setIcon(mkIcon(rec.pos_method));mkrs[id].getPopup().setContent(pop);}
-  else{mkrs[id]=L.marker([rec.lat,rec.lon],{icon:mkIcon(rec.pos_method)}).addTo(map).bindPopup(pop);map.panTo([rec.lat,rec.lon]);}
+    <span style="color:var(--mu)">Linked dots:</span> ${samples} &nbsp;
+    <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz${ch}<br>${res}
+    <a href="#" onclick="_showSourceSamples('${esc(id)}');return false" style="color:var(--acc);font-size:.78rem">Show sample links</a>
+    &nbsp; <a href="#" onclick="hideSource('${esc(id)}');return false" style="color:var(--acc);font-size:.78rem">Hide</a>`;
+  if(mkrs[id]){mkrs[id].setLatLng([rec.lat,rec.lon]).setIcon(mkIcon(rec,_selectedSourceId===id));mkrs[id].getPopup().setContent(pop);}
+  else{
+    mkrs[id]=L.marker([rec.lat,rec.lon],{icon:mkIcon(rec,_selectedSourceId===id)}).addTo(map).bindPopup(pop);
+    mkrs[id].on('click',e=>{if(e&&e.originalEvent)L.DomEvent.stopPropagation(e);_showSourceSamples(id);});
+    map.panTo([rec.lat,rec.lon]);
+  }
   if(!_markerVisible(rec)) mkrs[id].remove();
-  refreshMapCount();
+  _refreshRelationshipLines();
+  refreshMapStats();
 }
 function hideSource(id){
   if(mkrs[id]){mkrs[id].remove();delete mkrs[id];}
+  if(_selectedSourceId===id)_clearSampleLines();
+  _refreshRelationshipLines();
   if(map) map.closePopup();
-  refreshMapCount();
+  refreshMapStats();
 }
 function mapFilter(btn){
   _mapFilter=btn.dataset.m;
-  document.querySelectorAll('.mfpill').forEach(b=>b.classList.toggle('active',b===btn));
+  document.querySelectorAll('.mfpill[data-m]').forEach(b=>b.classList.toggle('active',b===btn));
   applyMapFilters();
 }
 function mapFilterLegend(el){
   el.classList.toggle('hidden');
   const m=el.dataset.m, hide=el.classList.contains('hidden');
   Object.entries(mkrs).forEach(([id,mk])=>{
-    if((srcs[id]?.pos_method||'')=== m){ if(hide) mk.remove(); else mk.addTo(map); }
+    if((srcs[id]?.pos_method||'')=== m){ if(hide) mk.remove(); else if(_markerVisible(srcs[id])) mk.addTo(map); }
   });
-  refreshMapCount();
+  _refreshRelationshipLines();
+  refreshMapStats();
 }
 let _pathsVisible=true;
 
@@ -184,11 +607,12 @@ function _setPathVisible(p, on){
   if(on){p.layer.addTo(map);p.dots.forEach(d=>d.addTo(map));}
   else{p.layer.remove();p.dots.forEach(d=>d.remove());}
   p.visible=on;
+  refreshMapStats();
 }
 function _renderPathsList(){
   const el=document.getElementById('map-paths-list'); if(!el) return;
   if(!_loadedPaths.length){
-    el.innerHTML='<span style="color:var(--mu);font-size:.7rem">Paths load automatically when sessions are solved.</span>';
+    el.innerHTML='<span style="color:var(--mu);font-size:.7rem">Use Sessions → Map Path to load a decimated, Pi-safe route/observation overlay.</span>';
     return;
   }
   el.innerHTML=_loadedPaths.map((p,i)=>{
@@ -197,7 +621,7 @@ function _renderPathsList(){
       ?`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${p.color};flex-shrink:0"></span>`
       :`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid ${p.color};background:transparent;flex-shrink:0"></span>`;
     const nameStyle=`flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.7rem;${on?'color:var(--txt)':'color:var(--mu);text-decoration:line-through'}`;
-    const sub=p.gps?`${p.points} GPS pts`:`${p.points||0} frame pts`;
+    const sub=p.overview?`${p.points||0} preview pts`:(p.gps?`${p.gps} GPS / ${p.obs||0} frame pts`:`${p.points||0} frame pts`); // displayed points are decimated for fat sessions
     return `<div style="display:flex;align-items:center;gap:.3rem;margin-bottom:.25rem;cursor:pointer" onclick="toggleOnePath(${i})" title="Click to show/hide">
       ${dot}
       <span style="${nameStyle}" title="${p.name}">${p.name}</span>
@@ -225,60 +649,128 @@ function toggleAllPaths(){
   _updatePathsToggleBtn();
   _renderPathsList();
 }
-function addPathFromSession(path, name){
-  if(_loadedPaths.some(p=>p.path===path)) return;
+function addPathFromSession(path, name, opts){
+  opts=opts||{};
+  const overview=!!opts.overview;
+  const existingIdx=_loadedPaths.findIndex(p=>p.path===path);
+  if(existingIdx>=0){
+    // Manual Map Path upgrades a cheap bulk overview to the full decimated RF-dot view.
+    if(!overview&&_loadedPaths[existingIdx].overview){removeLoadedPath(existingIdx);}
+    else return Promise.resolve({skipped:true,path});
+  }
   initMap();
-  fetch('/api/session/records?path='+encodeURIComponent(path))
+  const url=overview
+    ?('/api/session/records?map=1&overview=1&max_points='+(opts.maxPoints||900)+'&path='+encodeURIComponent(path))
+    :('/api/session/records?map=1&max_gps=2500&max_obs=6000&path='+encodeURIComponent(path));
+  return fetch(url)
     .then(r=>r.json()).then(recs=>{
-      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null).sort((a,b)=>(a.t||0)-(b.t||0));
-      if(!georecs.length) return;
-      const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps');
-      const pathrecs=gpsrecs.length?gpsrecs:georecs;
+      if(!overview) _indexSamplesFromRecords(path,recs);
+      if(_selectedSourceId){
+        const srec=srcs[_selectedSourceId], sk=srec?_sourcePrimaryId(srec):'';
+        if(sk&&_sourceSampleFetches[sk]==='done') delete _sourceSampleFetches[sk];
+        _showSourceSamples(_selectedSourceId);
+      }
+      // Keep file order. Frame timestamps and GPS timestamps may come from
+      // different clocks, so sorting by t can fold the trail back on itself.
+      const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null);
+      if(!georecs.length) return {empty:true,path};
+      const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps'||r.record_type==='route');
+      const obsrecs=overview?[]:georecs.filter(r=>!(r.record_type==='gps'||r.source==='gps'||r.record_type==='route'));
+      const routrecs=gpsrecs.length?gpsrecs:obsrecs;
       const color=_PATH_COLORS[_loadedPaths.length%_PATH_COLORS.length];
       const on=_pathsVisible;
-      const layer=L.polyline(pathrecs.map(r=>[r.lat,r.lon]),
-        {color,opacity:.55,weight:2,dashArray:gpsrecs.length?'':'6 4'});
+      const layer=L.polyline(routrecs.map(r=>[r.lat,r.lon]),
+        {color,opacity:overview?.42:.55,weight:overview?2.4:2,dashArray:gpsrecs.length?'':'6 4'});
       if(on) layer.addTo(map);
-      const dots=pathrecs.map(r=>{
-        const isGps=(r.record_type==='gps'||r.source==='gps');
-        const dot=L.circleMarker([r.lat,r.lon],{radius:isGps?3:4,color,fillColor:color,fillOpacity:.7,weight:1.2});
+      // GPS breadcrumbs draw the route. Observation dots are drawn only for
+      // manual Map Path. Bulk solve gets cheap route previews so a Pi does not
+      // create tens of thousands of Leaflet markers.
+      const dotrecs=overview?gpsrecs:gpsrecs.concat(obsrecs);
+      const dots=dotrecs.map(r=>{
+        const isGps=(r.record_type==='gps'||r.source==='gps'||r.record_type==='route');
+        const stale=r.gps_held||r.gps_hold_s!=null;
+        const dot=L.circleMarker([r.lat,r.lon],{radius:overview?2.4:(isGps?3:4),color,fillColor:color,fillOpacity:overview?.48:(isGps ? .55 : .78),weight:overview?1:(isGps?1.1:1.5),dashArray:stale?'2 3':null});
         const ts=r.t?new Date(r.t*1000).toISOString().slice(11,19):'?';
         const freq=r.freq?(r.freq/1e6).toFixed(0)+' MHz':'?';
         const coords=`<span style="font-family:monospace;font-size:.7rem;color:var(--mu)">${(+r.lat).toFixed(6)}, ${(+r.lon).toFixed(6)}</span>`;
-        const pop=isGps
-          ?`<b>GPS breadcrumb</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
-          :`${r.ssid?`<b>${r.ssid}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
-            +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
-            +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
-            +`<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
+        const held=stale?`<br><span style="color:var(--ylw)">GPS held:</span> ${r.gps_hold_s??r.gps_age_s??'?'}s`:'';
+        const pop=overview
+          ?`<b>Bulk route preview</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
+          :isGps
+            ?`<b>GPS breadcrumb</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
+            :`${_displaySSID(r.ssid)?`<b>${_xmlEsc(_displaySSID(r.ssid))}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
+              +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
+              +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
+              +`${held}<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
         dot.bindPopup(pop,{maxWidth:230,className:'aw-path-tip'});
         if(on) dot.addTo(map);
         return dot;
       });
-      _loadedPaths.push({name,path,color,layer,dots,visible:on,gps:gpsrecs.length,points:pathrecs.length});
+      const firstPath=_loadedPaths.length===0;
+      _loadedPaths.push({name,path,color,layer,dots,visible:on,gps:gpsrecs.length,obs:obsrecs.length,points:dotrecs.length,overview});
+      if(firstPath&&layer.getBounds&&layer.getBounds().isValid&&layer.getBounds().isValid()){
+        try{map.fitBounds(layer.getBounds().pad(0.08));}catch(e){}
+      }
       _renderPathsList();
+      refreshMapStats();
     });
+}
+function _dropSamplePath(path){
+  for(const bucket of [_sourceSamples,_sourceSamplesByAp]){
+    Object.keys(bucket).forEach(k=>{bucket[k]=(bucket[k]||[]).filter(s=>s.path!==path&&!String(s.path||'').startsWith(path+'#')); if(!bucket[k].length) delete bucket[k];});
+  }
+  Object.keys(_networkRelations).forEach(k=>{_networkRelations[k]=(_networkRelations[k]||[]).filter(x=>x.path!==path&&!String(x.path||'').startsWith(path+'#')); if(!_networkRelations[k].length) delete _networkRelations[k];});
 }
 function removeLoadedPath(i){
   const p=_loadedPaths[i]; if(!p) return;
   p.layer.remove(); p.dots.forEach(d=>d.remove());
+  _dropSamplePath(p.path);
   _loadedPaths.splice(i,1);
+  if(_selectedSourceId) _showSourceSamples(_selectedSourceId);
   _renderPathsList();
+  refreshMapStats();
 }
 function clearAllPaths(){
-  _loadedPaths.forEach(p=>{p.layer.remove();p.dots.forEach(d=>d.remove());});
+  _loadedPaths.forEach(p=>{p.layer.remove();p.dots.forEach(d=>d.remove());_dropSamplePath(p.path);});
   _loadedPaths=[];
+  _clearSampleLines();
   _renderPathsList();
+  refreshMapStats();
 }
-function refreshMapCount(){
-  const el=document.getElementById('map-count'); if(!el)return;
-  const vis=Object.keys(mkrs).length;
-  el.textContent=vis+' source'+(vis!==1?'s':'')+' on map';
+function refreshMapStats(){
+  const srcEl=document.getElementById('map-count');
+  const relEl=document.getElementById('map-rel-count');
+  const pathEl=document.getElementById('map-path-count');
+  if(!map){return;}
+  let vis=0, ap=0, cli=0, unk=0;
+  Object.entries(mkrs).forEach(([id,m])=>{
+    const rec=srcs[id];
+    if(rec&&map.hasLayer(m)&&_pointInCurrentView(rec.lat,rec.lon)){
+      vis++; const r=_srcRole(rec); if(r==='ap')ap++; else if(r==='client')cli++; else unk++;
+    }
+  });
+  if(srcEl) srcEl.textContent=`${vis} source${vis!==1?'s':''} in view (${ap} AP / ${cli} client / ${unk} other)`;
+  if(relEl){
+    const n=Object.values(_relLines).filter(l=>map.hasLayer(l)).length;
+    relEl.textContent=n+' AP↔client link'+(n!==1?'s':'')+' in view';
+  }
+  if(pathEl){
+    let pts=0, routes=0;
+    _loadedPaths.forEach(p=>{
+      if(p.visible===false) return;
+      if(p.layer&&map.hasLayer(p.layer)) routes++;
+      pts += (p.dots||[]).filter(d=>map.hasLayer(d)&&_pointInCurrentView(d.getLatLng().lat,d.getLatLng().lng)).length;
+    });
+    pathEl.textContent=routes+' path'+(routes!==1?'s':'')+', '+pts+' path point'+(pts!==1?'s':'')+' in view';
+  }
+  _updateSelectedSampleStat();
 }
+function refreshMapCount(){refreshMapStats();}
+
 
 // ── Map export ────────────────────────────────────────────────────────────────
 function _visibleSrcs(){
-  return Object.values(srcs).filter(r=>r.lat&&r.lon&&mkrs[r.id]&&_markerVisible(r));
+  return Object.values(srcs).filter(r=>r.lat&&r.lon&&mkrs[r.id]&&map&&map.hasLayer(mkrs[r.id])&&_markerVisible(r));
 }
 function _dlBlob(data,name,type){
   const a=document.createElement('a');
@@ -297,7 +789,7 @@ function exportMapJSONL(){
   const rows=_visibleSrcs();
   if(!rows.length){alert('No visible sources to export.');return;}
   _dlBlob(rows.map(r=>JSON.stringify(r)).join('\n'),'aetherward-positions.jsonl','application/x-ndjson');
-  document.getElementById('map-export-dd').style.display='none';
+  {const dd=document.getElementById('map-export-dd'); if(dd) dd.style.display='none';}
 }
 function exportMapWigle(){
   const rows=_visibleSrcs();
@@ -310,11 +802,11 @@ function exportMapWigle(){
     const freq=Math.round((r.freq_mhz||0)*1000); // kHz
     const rssi=r.rssi!=null?r.rssi:-65;
     const acc=r.residual_m!=null?(+r.residual_m).toFixed(1):0;
-    return [r.id||'',_csvEsc(r.ssid||''),_csvEsc(r.auth_mode||r.security||''),ts,ch,freq,rssi,
+    return [r.id||'',_csvEsc(_cleanSSID(r.ssid)||''),_csvEsc(r.auth_mode||r.security||''),ts,ch,freq,rssi,
             (+r.lat).toFixed(7),(+r.lon).toFixed(7),0,acc,'WIFI'].join(',');
   }).join('\n');
   _dlBlob(hdr+csv,'aetherward-wigle.csv','text/csv');
-  document.getElementById('map-export-dd').style.display='none';
+  {const dd=document.getElementById('map-export-dd'); if(dd) dd.style.display='none';}
 }
 function _xmlEsc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function exportMapGeoJSON(){
@@ -323,7 +815,7 @@ function exportMapGeoJSON(){
   const features=rows.map(r=>({
     type:'Feature',
     geometry:{type:'Point',coordinates:[(+r.lon),(+r.lat),0]},
-    properties:{id:r.id||'',ssid:r.ssid||'',auth_mode:r.auth_mode||'',security:r.security||'',
+    properties:{id:r.id||'',ssid:_cleanSSID(r.ssid)||'',auth_mode:r.auth_mode||'',security:r.security||'',
                 bssid:r.bssid||'',channel:r.channel??null,pos_method:r.pos_method||'',
                 rssi:r.rssi??null,freq_mhz:r.freq_mhz??null,samples:r.samples??null,
                 residual_m:r.residual_m??null},
@@ -344,7 +836,7 @@ function exportMapKML(){
   if(!rows.length){alert('No visible sources to export.');return;}
   const placemarks=rows.map(r=>
     `<Placemark><name>${_xmlEsc(r.id||'')}</name>`+
-    `<description>SSID: ${_xmlEsc(r.ssid||'')}  Auth: ${_xmlEsc(r.auth_mode||r.security||'')}  RSSI: ${r.rssi??'?'} dBm  `+
+    `<description>SSID: ${_xmlEsc(_cleanSSID(r.ssid)||'<empty SSID>')}  Auth: ${_xmlEsc(r.auth_mode||r.security||'')}  RSSI: ${r.rssi??'?'} dBm  `+
     `Samples: ${r.samples??'?'}  Method: ${r.pos_method||'?'}</description>`+
     `<Point><coordinates>${(+r.lon).toFixed(7)},${(+r.lat).toFixed(7)},0</coordinates></Point></Placemark>`
   ).join('\n');
@@ -363,8 +855,13 @@ function connectSSE(){
     } else if(rec.type==='source_removed'){
       delete srcs[rec.id];
       if(mkrs[rec.id]){mkrs[rec.id].remove();delete mkrs[rec.id];}
-      updateHeader(); refreshMapCount();
+      if(_selectedSourceId===rec.id)_clearSampleLines();
+      _refreshRelationshipLines();
+      updateHeader(); refreshMapStats();
       if(document.getElementById('panel-positions').classList.contains('active')) renderPositions();
+    } else if(rec.type==='session_path_ready'){
+      addPathFromSession(rec.path, rec.name||rec.path.split('/').pop(), {overview:!!rec.overview, maxPoints:900});
+      if(rec.overview) sysLog('Loaded route preview: '+(rec.name||rec.path.split('/').pop()));
     } else if(rec.type==='log'){
       if(rec.source==='solve') appendSolveLog(rec.text);
       else appendRunLog(rec.text);
@@ -474,7 +971,8 @@ function renderPositions(){
   tb.innerHTML=rows.length===0
     ?'<tr><td colspan="8" style="color:var(--mu);text-align:center;padding:1.25rem">No sources yet — start the solver</td></tr>'
     :rows.map(r=>{
-      const lbl=r.ssid?`<b>${r.ssid}</b> <span style="color:var(--mu)">${r.id}</span>`:r.id;
+      const ss=_displaySSID(r.ssid);
+      const lbl=ss?`<b>${_xmlEsc(ss)}</b> <span style="color:var(--mu)">${r.id}</span>`:r.id;
       const res=r.residual_dBm!=null?r.residual_dBm+' dB':r.residual_m!=null?(+r.residual_m).toFixed(1)+' m':'—';
       return `<tr>
         <td>${lbl}</td>
@@ -496,7 +994,7 @@ function openSrcModal(rec){
   document.getElementById('src-modal-title').textContent = rec ? 'Edit source' : 'Add source';
   document.getElementById('src-id').value    = rec?.id||'';
   document.getElementById('src-id').readOnly = !!rec;
-  document.getElementById('src-ssid').value  = rec?.ssid||'';
+  document.getElementById('src-ssid').value  = _cleanSSID(rec?.ssid)||'';
   document.getElementById('src-lat').value   = rec?.lat??'';
   document.getElementById('src-lon').value   = rec?.lon??'';
   document.getElementById('src-freq').value  = rec?.freq_mhz||'';
@@ -534,7 +1032,8 @@ function startSolve(){
   fetch('/api/solve/start',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({session,config:document.getElementById('sl-config').value||null,
       n_exp:parseFloat(document.getElementById('sl-nexp').value),
-      min_obs:parseInt(document.getElementById('sl-minobs').value)})})
+      min_obs:parseInt(document.getElementById('sl-minobs').value),
+      follow:!!document.getElementById('sl-follow')?.checked})})
     .then(()=>{
       loadStatus();
       sysLog('Solver started: '+session.split('/').pop());
@@ -546,7 +1045,7 @@ function stopSolve(){fetch('/api/solve/stop',{method:'POST'}).then(()=>{loadStat
 function appendLog(rec){
   const el=document.getElementById('sl-log'); if(!el)return;
   const ts=new Date().toISOString().slice(11,19);
-  el.innerHTML+=`<div class="log-upd">${ts} [${rec.pos_method}] ${rec.ssid||rec.id||'?'} ${(+rec.lat).toFixed(5)}, ${(+rec.lon).toFixed(5)} s=${rec.samples??'?'}</div>`;
+  el.innerHTML+=`<div class="log-upd">${ts} [${rec.pos_method}] ${_displaySSID(rec.ssid)||rec.id||'?'} ${(+rec.lat).toFixed(5)}, ${(+rec.lon).toFixed(5)} s=${rec.samples??'?'}</div>`;
   el.scrollTop=el.scrollHeight;
 }
 function sysLog(msg){
@@ -576,21 +1075,47 @@ function appendRunLog(text){
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
+let _bulkPathQueue=[], _bulkPathBusy=false;
+function _sessionDisplayName(s){return (s.folder?`${s.folder}/`:'')+(s.name||String(s.path||'').split('/').pop());}
+function _queueBulkPathPreviews(sessions){
+  const allowed=new Set(['wardriver','tdoa_raw','unknown']);
+  const existing=new Set(_loadedPaths.map(p=>p.path));
+  let added=0;
+  (sessions||[]).forEach(s=>{
+    if(!s||!s.path||existing.has(s.path)) return;
+    if(s.stype&&!allowed.has(s.stype)) return;
+    existing.add(s.path);
+    _bulkPathQueue.push({path:s.path,name:_sessionDisplayName(s)});
+    added++;
+  });
+  if(added) sysLog(`Queued ${added} bulk route preview${added!==1?'s':''}.`);
+  _drainBulkPathQueue();
+}
+function _drainBulkPathQueue(){
+  if(_bulkPathBusy) return;
+  const item=_bulkPathQueue.shift();
+  if(!item) return;
+  _bulkPathBusy=true;
+  addPathFromSession(item.path,item.name,{overview:true,maxPoints:900})
+    .finally(()=>{_bulkPathBusy=false;setTimeout(_drainBulkPathQueue,20);});
+}
 function solveAllSessions(){
   const btn=document.getElementById('sess-solve-all-btn');
   btn.disabled=true; btn.textContent='Solving…';
-  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_cells:256,
+      n_exp:parseFloat(document.getElementById('sl-nexp')?.value||'2.5'),
+      min_obs:parseInt(document.getElementById('sl-minobs')?.value||'3')})})
     .then(r=>r.json()).then(d=>{
       btn.disabled=false; btn.textContent='Solve All';
       if(d.error){alert('Error: '+d.error);return;}
       const note=document.createElement('span');
       note.style='font-size:.74rem;color:var(--grn);margin-left:.5rem';
-      note.textContent='✓ '+d.solved+' source'+(d.solved!==1?'s':'')+' from '+d.sessions+' session'+(d.sessions!==1?'s':'');
+      note.textContent='✓ bulk solve started (route previews will auto-load)';
       btn.after(note); setTimeout(()=>note.remove(),5000);
-      fetch('/api/positions/all').then(r=>r.json()).then(pts=>{pts.forEach(updateMarker);refreshMapCount();});
-      // Auto-load GPS paths for all solvable sessions
-      _sessAllData.filter(s=>s.stype==='wardriver'||s.stype==='tdoa_raw'||s.stype==='unknown')
-        .forEach(s=>addPathFromSession(s.path, s.name));
+      loadStatus();
+      sysLog('Bulk solve started. Loading lightweight route previews for every session; use Sessions → Map Path to upgrade one file with RF dots.');
+      if(Array.isArray(d.sessions)) _queueBulkPathPreviews(d.sessions);
+      else fetch('/api/sessions').then(r=>r.json()).then(_queueBulkPathPreviews).catch(()=>{});
     }).catch(err=>{btn.disabled=false;btn.textContent='Solve All';alert('Failed: '+err);});
 }
 function fmtSz(b){return b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';}
@@ -672,7 +1197,8 @@ function _sessRender(){
     const del=`<button class="btn btn-del"  onclick="deleteSession('${p}','${n}')">Del</button>`;
     const _bs='padding:.2rem .5rem;font-size:.73rem';
     if(s.stype==='wardriver'||s.stype==='tdoa_raw')
-      return `<button class="btn btn-s" style="${_bs}" onclick="quickSolve('${p}')">Solve</button>${dl}${ren}${del}`;
+      return `<button class="btn btn-s" style="${_bs}" onclick="quickSolve('${p}')">Solve</button>`
+            +`<button class="btn btn-s" style="${_bs}" onclick="quickMapPath('${p}','${n}')">Map Path</button>${dl}${ren}${del}`;
     if(s.stype==='enu')
       return `<button class="btn btn-s" style="${_bs}" onclick="quickViewEnu('${p}')">View ENU</button>`
             +`<button class="btn btn-s" style="${_bs}" onclick="quickView3d('${p}')">View 3D</button>${dl}${ren}${del}`;
@@ -709,12 +1235,21 @@ function _sessRender(){
   }
   tb.innerHTML=rows.join('');
 }
+
+function quickMapPath(path,name){
+  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab==='map'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-map').classList.add('active');
+  initMap(); if(map) map.invalidateSize();
+  addPathFromSession(path,name||path.split('/').pop());
+}
+
 function quickSolve(path){
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab==='solve'));
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-solve').classList.add('active');
   loadSessions(); loadConfigs();
-  setTimeout(()=>{document.getElementById('sl-session').value=path; startSolve();},300);
+  setTimeout(()=>{document.getElementById('sl-session').value=path; const f=document.getElementById('sl-follow'); if(f) f.checked=false; startSolve();},300);
 }
 function quickViewEnu(path){
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab==='enu'));
