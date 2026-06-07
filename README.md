@@ -7,6 +7,8 @@
 [![Tests](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml/badge.svg)](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml)
 ![Version](https://img.shields.io/badge/version-0.3.3-orange?style=flat-square)
 
+<p align="center"><sub><i>Knowledge should be free 🏴‍☠️</i></sub></p>
+
 **Hardware-agnostic RF observation framework.**  
 Capture, record, sanity-check, map, and solve RF observations from Wi-Fi adapters and other pluggable radio backends.
 
