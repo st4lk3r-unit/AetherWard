@@ -75,10 +75,18 @@ def record_get(rec: dict, key: str, default: Any = None) -> Any:
     if key in meta and meta[key] not in (None, '', [], {}):
         return meta[key]
     aliases = {
-        'id': ('identifier', 'bssid', 'sta', 'mac'),
-        'identifier': ('id', 'bssid', 'sta', 'mac'),
+        'id': ('identifier', 'bssid', 'sta', 'station', 'client', 'mac'),
+        'identifier': ('id', 'bssid', 'sta', 'station', 'client', 'mac'),
         'auth_mode': ('security',),
-        'bssid': ('id', 'identifier'),
+        # Relationship aliases appear in older sessions and in some backend
+        # versions.  Keep them here so the solver/web map can build AP↔client
+        # links from the same data the user sees in popups/tables.
+        'bssid': ('associated_bssid', 'associated', 'ap_bssid', 'ap_mac', 'ap', 'id', 'identifier'),
+        'associated_bssid': ('associated', 'associated_ap', 'ap_bssid', 'ap_mac', 'ap'),
+        'linked_client': ('client', 'station', 'sta', 'linked_station', 'associated_client'),
+        'client': ('station', 'sta', 'mac', 'linked_client'),
+        'station': ('client', 'sta', 'mac', 'linked_client'),
+        'source_role': ('role', 'kind'),
     }
     for alias in aliases.get(key, ()): 
         val = rec.get(alias, None)
@@ -101,15 +109,55 @@ def record_source_id(rec: dict) -> str:
         return 'anon:0'
 
 
+def _norm_macish(value: Any) -> str:
+    return str(value or '').strip().lower()
+
+
+def _bad_relation_mac(value: Any) -> bool:
+    v = _norm_macish(value)
+    return v in ('', 'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', 'none', 'null')
+
+
+def _clean_ssid(value: Any) -> Any:
+    # Older/imported captures sometimes used the literal placeholder
+    # "defaultSSID" when the SSID element was absent or empty.  That is not a
+    # real network name; keep it empty so the UI can say "<empty SSID>".
+    if isinstance(value, str) and value.strip().lower() == 'defaultssid':
+        return ''
+    return value
+
+
 def source_meta_from_record(rec: dict) -> dict:
     keys = (
         'ssid', 'protocol', 'auth_mode', 'security', 'bssid', 'channel',
         'band', 'frame_type', 'frame_subtype', 'privacy', 'akm_suites',
         'pairwise_ciphers', 'group_cipher', 'vendor_ouis', 'capabilities',
-        'beacon_interval', 'addr1', 'addr2', 'addr3',
+        'beacon_interval', 'addr1', 'addr2', 'addr3', 'source_role',
+        'client', 'station', 'associated_bssid', 'associated', 'ap_bssid',
+        'ap_mac', 'associated_ap', 'linked_client', 'linked_station',
+        'associated_client', 'to_ds', 'from_ds',
     )
     meta = {k: record_get(rec, k) for k in keys}
-    meta = {k: v for k, v in meta.items() if v not in (None, '', [], {})}
+    if 'ssid' in meta:
+        meta['ssid'] = _clean_ssid(meta.get('ssid'))
+    meta = {k: v for k, v in meta.items() if v not in (None, [], {}) and (v != '' or k == 'ssid')}
+
+    # Never manufacture a self-referential AP/client relation.  This used to
+    # happen when associated_bssid fell back to bssid, producing popups like
+    # "Linked AP: aa:bb:..." on the same client MAC.
+    self_ids = {_norm_macish(record_get(rec, k)) for k in ('id', 'identifier', 'client', 'station')}
+    self_ids |= {_norm_macish(meta.get(k)) for k in ('id', 'identifier', 'client', 'station')}
+    self_ids = {x for x in self_ids if x}
+    assoc = _norm_macish(meta.get('associated_bssid'))
+    if assoc and (_bad_relation_mac(assoc) or assoc in self_ids):
+        meta.pop('associated_bssid', None)
+    linked = _norm_macish(meta.get('linked_client'))
+    ap_ids = {_norm_macish(record_get(rec, k)) for k in ('id', 'identifier', 'bssid')}
+    ap_ids |= {_norm_macish(meta.get(k)) for k in ('id', 'identifier', 'bssid')}
+    ap_ids = {x for x in ap_ids if x}
+    if linked and (_bad_relation_mac(linked) or linked in ap_ids):
+        meta.pop('linked_client', None)
+
     freq = rec.get('freq')
     if freq is not None:
         try:

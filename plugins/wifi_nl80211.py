@@ -483,15 +483,66 @@ class NL80211Backend(HardwareBackend):
         is_ap_advert = pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)
         is_probe_req = pkt.haslayer(Dot11ProbeReq)
 
+        # Work out the *transmitting* RF source and, when possible, the
+        # infrastructure relationship.  RSSI belongs to whoever transmitted
+        # this frame, so client→AP data frames must position the client, not
+        # the AP.  The linked AP BSSID is still preserved for relationship
+        # overlays in the web map.
+        try:
+            fcfield = int(getattr(d11, 'FCfield', 0) or 0)
+        except Exception:
+            fcfield = 0
+        to_ds = bool(fcfield & 0x01)
+        from_ds = bool(fcfield & 0x02)
+        if to_ds:
+            meta['to_ds'] = True
+        if from_ds:
+            meta['from_ds'] = True
+
+        def _is_broadcast(mac) -> bool:
+            return str(mac or '').lower() in ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00', '')
+
         # Management AP frames: addr3 is the BSSID; addr2 is transmitter.
         if is_ap_advert:
             bssid = d11.addr3 or d11.addr2
             if bssid:
                 meta['bssid'] = bssid
                 meta['identifier'] = bssid
+                meta['source_role'] = 'ap'
         elif is_probe_req and d11.addr2:
+            # Probe requests are transmitted by a station/client.
+            meta['station'] = d11.addr2
+            meta['client'] = d11.addr2
+            meta['identifier'] = d11.addr2
+            meta['source_role'] = 'client'
+        elif ftype == 2 and to_ds and not from_ds and d11.addr2:
+            # Infrastructure data: client/station -> AP.
+            meta['client'] = d11.addr2
             meta['station'] = d11.addr2
             meta['identifier'] = d11.addr2
+            meta['source_role'] = 'client'
+            if not _is_broadcast(d11.addr1):
+                meta['bssid'] = d11.addr1
+                meta['associated_bssid'] = d11.addr1
+        elif ftype == 2 and from_ds and not to_ds:
+            # Infrastructure data: AP -> client.  RSSI is from the AP.
+            ap = d11.addr2 or d11.addr3
+            if ap:
+                meta['bssid'] = ap
+                meta['identifier'] = ap
+                meta['source_role'] = 'ap'
+            if not _is_broadcast(d11.addr1):
+                meta['linked_client'] = d11.addr1
+        elif ftype == 0 and stype in (0, 2) and d11.addr2:
+            # Association / reassociation requests are station-originated.
+            meta['station'] = d11.addr2
+            meta['client'] = d11.addr2
+            meta['identifier'] = d11.addr2
+            meta['source_role'] = 'client'
+            bssid = d11.addr1 or d11.addr3
+            if not _is_broadcast(bssid):
+                meta['bssid'] = bssid
+                meta['associated_bssid'] = bssid
         elif d11.addr3:
             meta['bssid'] = d11.addr3
             meta['identifier'] = d11.addr3
