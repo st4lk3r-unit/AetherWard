@@ -245,7 +245,8 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None,
         }
         for k in ('frame_type', 'frame_subtype', 'privacy', 'akm_suites',
                   'pairwise_ciphers', 'group_cipher', 'vendor_ouis',
-                  'capabilities', 'beacon_interval'):
+                  'capabilities', 'beacon_interval', 'source_role',
+                  'client', 'station', 'associated_bssid', 'linked_client'):
             if k in meta:
                 result[k] = meta[k]
         results.append(result)
@@ -277,7 +278,8 @@ def _proc_wardrive_map(records: list, fmt: str, out_path: str | None,
         buf = io.StringIO()
         if results:
             fieldnames = sorted({k for r in results for k in r.keys()})
-            preferred = ['id', 'ssid', 'auth_mode', 'security', 'protocol', 'channel',
+            preferred = ['id', 'source_role', 'ssid', 'auth_mode', 'security', 'protocol',
+                         'bssid', 'associated_bssid', 'client', 'station', 'channel',
                          'freq_mhz', 'rssi_mean', 'samples', 'lat', 'lon', 'alt',
                          'pos_method']
             fieldnames = preferred + [f for f in fieldnames if f not in preferred]
@@ -979,10 +981,16 @@ def _cmd_solve(args) -> None:
                 if rec.get('lat') is not None:
                     rss_obs[sid].append((rec['lat'], rec['lon'],
                                          rec.get('rssi', -100.0)))
-                if sid not in rss_meta:
-                    rss_meta[sid] = source_meta_from_record(rec)
-                    rss_meta[sid].setdefault('ssid', '')
-                    rss_meta[sid].setdefault('protocol', '')
+                meta = source_meta_from_record(rec)
+                cur = rss_meta.setdefault(sid, {})
+                for k, v in meta.items():
+                    if v not in (None, '', [], {}) and cur.get(k) in (None, '', [], {}):
+                        cur[k] = v
+                for alias in ('associated', 'associated_ap', 'ap_bssid', 'ap_mac', 'ap'):
+                    if cur.get('associated_bssid') in (None, '', [], {}) and cur.get(alias) not in (None, '', [], {}):
+                        cur['associated_bssid'] = cur[alias]
+                cur.setdefault('ssid', '')
+                cur.setdefault('protocol', '')
 
                 # TDOA accumulation
                 if tdoa_solve and rec.get('ant'):

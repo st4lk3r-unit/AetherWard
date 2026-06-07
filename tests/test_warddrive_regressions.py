@@ -391,8 +391,8 @@ class TestNL80211Recovery:
         ]
 
 class TestGpsStalenessRegression:
-    def test_stale_array_position_is_not_written_to_observation(self):
-        out = _session_path('stale_gps_not_geotagged.jsonl')
+    def test_stale_array_position_is_kept_for_geotagging_but_marked(self):
+        out = _session_path('stale_gps_held_geotag.jsonl')
         out.unlink(missing_ok=True)
         gps = AbsolutePosition(lat=48.0, lon=2.0, alt=0.0,
                                timestamp=1_000_000.0,
@@ -406,8 +406,10 @@ class TestGpsStalenessRegression:
         mode.stop()
 
         rec = json.loads(out.read_text().strip())
-        assert 'lat' not in rec
-        assert 'lon' not in rec
+        assert rec['lat'] == pytest.approx(48.0)
+        assert rec['lon'] == pytest.approx(2.0)
+        assert rec['gps_held'] is True
+        assert rec['gps_hold_s'] >= 5.0
 
     def test_wardriver_spelling_is_used_for_gps_ownership(self):
         assert 'warddriver' not in Path('cli/_commands.py').read_text()

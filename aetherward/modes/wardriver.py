@@ -90,6 +90,11 @@ class WardriverMode(ScanMode):
         self._lock     = threading.Lock()
         self._out_lock = threading.Lock()
         self._out_file = None
+        # Last valid GNSS position is intentionally retained for observation
+        # geotagging during short GPS blackouts (tunnels, urban canyons,
+        # receiver hiccups).  Breadcrumb records are still written only for
+        # real fresh fixes; held positions are marked on observations.
+        self._last_gps_ok_at: Optional[float] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -195,13 +200,23 @@ class WardriverMode(ScanMode):
         age = self._gps_age(gps, now)
         return age is None or age <= self._gps_max_age
 
+    def _gps_is_valid_for_geotag(self, gps) -> bool:
+        return gps is not None and gps.is_valid()
+
+    def _held_gps_age(self, gps, now: float | None = None) -> Optional[float]:
+        age = self._gps_age(gps, now)
+        if age is not None:
+            return age
+        if self._last_gps_ok_at is None:
+            return None
+        return max(0.0, (now or time.time()) - self._last_gps_ok_at)
+
     def _clear_stale_array_position(self, now: float | None = None) -> None:
-        pos = getattr(self.array, 'absolute_position', None)
-        if pos is not None and not self._gps_is_fresh(pos, now):
-            try:
-                self.array.absolute_position = None
-            except Exception:
-                pass
+        # Do not clear the array position just because the GNSS source has a
+        # temporary no-fix/stale cycle.  Captured RF frames should keep being
+        # geotagged with the last known position; the age is recorded on each
+        # observation so post-processing can see where the coordinate was held.
+        return
 
     def _gps_worker(self) -> None:
         last_warn = 0.0
@@ -211,17 +226,22 @@ class WardriverMode(ScanMode):
                 pos = self._gps_backend.get_position()
                 if pos is not None and pos.is_valid() and self._gps_is_fresh(pos, now):
                     self.array.update_position(pos)
+                    self._last_gps_ok_at = now
                     self._write_gps(pos)
                 elif pos is not None and pos.is_valid():
-                    self._clear_stale_array_position(now)
+                    # Keep using the last coordinate instead of cutting the
+                    # observation stream off the map.  This stale record may
+                    # itself be the last good coordinate returned by gpsd.
+                    if getattr(self.array, 'absolute_position', None) is None:
+                        self.array.update_position(pos)
                     if now - last_warn > 15.0:
                         age = self._gps_age(pos, now)
-                        print(f'[gps] stale fix ignored age={age:.1f}s max={self._gps_max_age:.1f}s',
+                        age_s = f'{age:.1f}s' if age is not None else 'unknown'
+                        print(f'[gps] stale fix; keeping last position for geotagging age={age_s} max={self._gps_max_age:.1f}s',
                               file=sys.stderr, flush=True)
                         last_warn = now
                 elif now - last_warn > 15.0:
-                    self._clear_stale_array_position(now)
-                    print('[gps] no valid fix; not geotagging new observations',
+                    print('[gps] no valid fix; keeping last position for geotagging if available',
                           file=sys.stderr, flush=True)
                     last_warn = now
                     if getattr(self._gps_backend, '_sock', True) is None:
@@ -232,9 +252,8 @@ class WardriverMode(ScanMode):
                             print(f'[gps] reconnect failed: {exc}',
                                   file=sys.stderr, flush=True)
             except Exception as exc:
-                self._clear_stale_array_position(now)
                 if now - last_warn > 15.0:
-                    print(f'[gps] position source error: {exc}',
+                    print(f'[gps] position source error: {exc}; keeping last position for geotagging if available',
                           file=sys.stderr, flush=True)
                     last_warn = now
             time.sleep(self._gps_interval)
@@ -336,7 +355,15 @@ class WardriverMode(ScanMode):
             ('frame_subtype', 'frame_subtype'), ('privacy', 'privacy'),
             ('akm_suites', 'akm_suites'), ('pairwise_ciphers', 'pairwise_ciphers'),
             ('group_cipher', 'group_cipher'), ('beacon_interval', 'beacon_interval'),
-            ('capabilities', 'capabilities'),
+            ('capabilities', 'capabilities'), ('addr1', 'addr1'),
+            ('addr2', 'addr2'), ('addr3', 'addr3'),
+            ('source_role', 'source_role'), ('client', 'client'),
+            ('station', 'station'), ('associated_bssid', 'associated_bssid'),
+            ('associated', 'associated'), ('associated_ap', 'associated_ap'),
+            ('ap_bssid', 'ap_bssid'), ('ap_mac', 'ap_mac'),
+            ('linked_client', 'linked_client'), ('linked_station', 'linked_station'),
+            ('associated_client', 'associated_client'), ('to_ds', 'to_ds'),
+            ('from_ds', 'from_ds'),
         ):
             value = meta.get(meta_key)
             if value not in (None, '', [], {}):
@@ -349,14 +376,19 @@ class WardriverMode(ScanMode):
             rec['raw_frame_hex'] = frame.data.hex()
             rec['raw_frame_b64'] = base64.b64encode(frame.data).decode('ascii')
 
-        if gps is not None and self._gps_is_fresh(gps):
+        if self._gps_is_valid_for_geotag(gps):
             rec['lat'] = gps.lat
             rec['lon'] = gps.lon
             rec['alt'] = gps.alt
             rec['fix'] = int(gps.fix_type)
-            age = self._gps_age(gps)
+            age = self._held_gps_age(gps)
             if age is not None:
                 rec['gps_age_s'] = round(age, 3)
+                if age > self._gps_max_age:
+                    rec['gps_held'] = True
+                    rec['gps_hold_s'] = round(age, 3)
+            elif not self._gps_is_fresh(gps):
+                rec['gps_held'] = True
         with self._out_lock:
             self._out_file.write(json.dumps(rec, separators=(',', ':')) + '\n')
 

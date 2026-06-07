@@ -232,11 +232,18 @@ input[type=checkbox]{accent-color:var(--acc)}
     <button class="mfpill"        data-m="rssi_centroid"     onclick="mapFilter(this)">Centroid</button>
     <button class="mfpill"        data-m="tdoa"              onclick="mapFilter(this)">TDOA</button>
     <span class="nav-sep" style="height:20px;flex-shrink:0"></span>
+    <span style="font-size:.71rem;color:var(--mu);flex-shrink:0">Role:</span>
+    <button class="mfpill mfpill-role active" data-role="all"     onclick="setMapRoleFilter(this)">All</button>
+    <button class="mfpill mfpill-role"        data-role="ap"      onclick="setMapRoleFilter(this)">AP only</button>
+    <button class="mfpill mfpill-role"        data-role="client"  onclick="setMapRoleFilter(this)">Clients only</button>
+    <button class="mfpill mfpill-role"        data-role="unknown" onclick="setMapRoleFilter(this)">Other</button>
+    <span class="nav-sep" style="height:20px;flex-shrink:0"></span>
     <input id="map-s-ssid"   class="mf-input" placeholder="SSID…"   style="width:88px"  oninput="_mapSearchSSID=this.value;applyMapFilters()">
-    <input id="map-s-mac"    class="mf-input" placeholder="MAC/ID…" style="width:102px;font-family:monospace" oninput="_mapSearchMAC=this.value;applyMapFilters()">
+    <input id="map-s-mac"    class="mf-input" placeholder="MAC/ID…" style="width:102px;font-family:monospace" oninput="mapMacSearchChanged(this.value)">
     <input id="map-s-radius" class="mf-input" placeholder="Radius m" type="number" min="0" style="width:84px" oninput="_mapSearchRadius=parseFloat(this.value)||0;applyMapFilters()">
     <button class="btn btn-s" id="map-s-center-btn" onclick="setRadiusCenter()" title="Set radius centre to current map centre" style="height:24px;font-size:.71rem;padding:.1rem .5rem;border-radius:12px">⊕ centre</button>
     <div style="flex:1"></div>
+    <button class="btn btn-s" id="relations-toggle-btn" onclick="toggleMapRelations(this)" style="font-size:.72rem;padding:.2rem .55rem">Relations ●</button>
     <button class="btn btn-s" id="paths-toggle-btn" onclick="toggleAllPaths()" style="font-size:.72rem;padding:.2rem .55rem">Paths ●</button>
   </div>
   <div id="map-wrap">
@@ -249,13 +256,23 @@ input[type=checkbox]{accent-color:var(--acc)}
     </div>
     <div class="map-overlay">
       <div class="legend">
+        <div style="color:var(--acc);font-weight:600;margin-bottom:.45rem;font-size:.73rem;letter-spacing:.05em">ROLE</div>
+        <div class="li"><div class="ld" style="background:var(--pur);border-radius:3px"></div><span style="color:var(--txt)">AP / BSSID</span></div>
+        <div class="li"><div class="ld" style="background:var(--cyn)"></div><span style="color:var(--txt)">Client / STA</span></div>
+        <div class="li"><div class="ld" style="background:var(--org);height:2px;border-radius:0"></div><span style="color:var(--txt)">AP↔client relation</span></div>
+        <div class="li"><div class="ld" style="background:var(--acc);height:2px;border-radius:0"></div><span style="color:var(--txt)">Selected sample links</span></div>
+      </div>
+      <div class="legend" style="margin-top:.45rem">
         <div style="color:var(--acc);font-weight:600;margin-bottom:.45rem;font-size:.73rem;letter-spacing:.05em">METHOD</div>
         <div class="li lc" data-m="rss_trilateration" onclick="mapFilterLegend(this)"><div class="ld" style="background:var(--blu)"></div><span style="color:var(--txt)">RSS trilateration</span></div>
         <div class="li lc" data-m="rssi_centroid"     onclick="mapFilterLegend(this)"><div class="ld" style="background:var(--ylw)"></div><span style="color:var(--txt)">RSSI centroid</span></div>
         <div class="li lc" data-m="tdoa"              onclick="mapFilterLegend(this)"><div class="ld" style="background:var(--acc)"></div><span style="color:var(--txt)">TDOA</span></div>
         <div class="li lc" data-m="manual"            onclick="mapFilterLegend(this)"><div class="ld" style="background:var(--mu)"></div><span style="color:var(--txt)">Manual</span></div>
       </div>
-      <div class="map-stat" id="map-count">0 sources on map</div>
+      <div class="map-stat" id="map-count">0 sources in view</div>
+      <div class="map-stat" id="map-rel-count">0 AP↔client links in view</div>
+      <div class="map-stat" id="map-link-count">No selected source</div>
+      <div class="map-stat" id="map-path-count">0 paths, 0 path points in view</div>
       <div class="map-stat" id="map-center" style="font-family:monospace;font-size:.68rem;letter-spacing:.03em;color:var(--mu);padding:.3rem .6rem">—</div>
       <div class="legend" style="margin-top:.45rem">
         <div style="color:var(--acc);font-weight:600;margin-bottom:.45rem;font-size:.73rem;letter-spacing:.05em">PATHS</div>
@@ -444,6 +461,15 @@ input[type=checkbox]{accent-color:var(--acc)}
           <span class="tip" data-tip="Minimum GPS-tagged observations\nrequired before running RSS trilateration.\nFewer than 3 always falls back to RSSI centroid.">?</span>
         </label>
         <input id="sl-minobs" type="number" value="3" min="1" max="30" style="width:66px">
+      </div>
+      <div class="fg">
+        <label>Mode</label>
+        <label style="display:flex;align-items:center;gap:.35rem;font-size:.78rem;color:var(--mu);height:32px">
+          <input id="sl-follow" type="checkbox" style="accent-color:var(--acc)">
+          Live follow
+          <span class="tip" data-tip="Off: solve a finished session once and return to idle.
+On: keep watching a growing capture file until Stop is pressed.">?</span>
+        </label>
       </div>
       <div class="fg">
         <label>&nbsp;</label>
