@@ -155,11 +155,14 @@ def rss_solve(
             break
 
     # ── Sanity check: reject solutions far outside the observation hull ────────
-    obs_span = max(
-        math.sqrt((pts[i][0][0] - pts[j][0][0])**2 +
-                  (pts[i][0][1] - pts[j][0][1])**2)
-        for i in range(len(pts)) for j in range(i + 1, len(pts))
-    )
+    # This used to compute the exact maximum pairwise point distance, O(n²).
+    # Web/bulk solving can feed hundreds of aggregated geo-cells per source and
+    # thousands of sources, so the exact hull span became a pointless hot path.
+    # The bbox diagonal is a safe upper-bound approximation for divergence
+    # rejection and keeps each source solve O(n).
+    xs = [pt[0][0] for pt in pts]
+    ys = [pt[0][1] for pt in pts]
+    obs_span = math.sqrt((max(xs) - min(xs))**2 + (max(ys) - min(ys))**2)
     dist_from_centroid = math.sqrt(sx*sx + sy*sy)
     if dist_from_centroid > max(obs_span * 5.0, 500.0):
         return None     # diverged — caller falls back to centroid
