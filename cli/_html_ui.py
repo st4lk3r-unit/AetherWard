@@ -243,6 +243,7 @@ input[type=checkbox]{accent-color:var(--acc)}
     <input id="map-s-radius" class="mf-input" placeholder="Radius m" type="number" min="0" style="width:84px" oninput="_mapSearchRadius=parseFloat(this.value)||0;applyMapFilters()">
     <button class="btn btn-s" id="map-s-center-btn" onclick="setRadiusCenter()" title="Set radius centre to current map centre" style="height:24px;font-size:.71rem;padding:.1rem .5rem;border-radius:12px">⊕ centre</button>
     <div style="flex:1"></div>
+    <button class="btn btn-s" id="cluster-toggle-btn" onclick="toggleMapClusters(this)" style="font-size:.72rem;padding:.2rem .55rem" title="Zoom-aware source clustering. Keeps all source records; only the map rendering is grouped.">Clusters ●</button>
     <button class="btn btn-s" id="relations-toggle-btn" onclick="toggleMapRelations(this)" style="font-size:.72rem;padding:.2rem .55rem">Relations ●</button>
     <button class="btn btn-s" id="paths-toggle-btn" onclick="toggleAllPaths()" style="font-size:.72rem;padding:.2rem .55rem">Paths ●</button>
   </div>
@@ -480,6 +481,32 @@ On: keep watching a growing capture file until Stop is pressed.">?</span>
       </div>
     </div>
     <div id="sl-enu-note" style="display:none;font-size:.72rem;color:var(--mu);margin-top:.3rem"></div>
+    <div id="sl-progress-wrap" style="margin-top:.45rem;display:none">
+      <div style="display:flex;align-items:center;gap:.6rem">
+        <div style="flex:1;height:8px;border:1px solid var(--bdr);background:var(--bg);border-radius:999px;overflow:hidden">
+          <div id="sl-progress-bar" style="height:100%;width:0%;background:var(--acc);transition:width .2s linear"></div>
+        </div>
+        <div id="sl-progress-pct" style="width:4.5rem;text-align:right;font-family:monospace;color:var(--mu);font-size:.72rem">idle</div>
+      </div>
+      <div id="sl-progress-text" style="margin-top:.2rem;font-family:monospace;color:var(--mu);font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">idle</div>
+    </div>
+    <div class="card" style="margin-top:.55rem;padding:.55rem .7rem;background:var(--bg);border-color:var(--bdr)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:.6rem;flex-wrap:wrap">
+        <div>
+          <b style="color:var(--txt);font-size:.82rem">Solved DB</b>
+          <div style="font-size:.71rem;color:var(--mu);margin-top:.12rem">Precomputed positions, solver sample-cells, and route previews in <code>~/.aetherward/solver</code>. Loading a DB avoids rescanning huge JSONL files for map/sample lookup.</div>
+        </div>
+        <div style="display:flex;gap:.35rem;align-items:center;flex-wrap:wrap">
+          <select id="solver-db-select" style="min-width:270px"><option value="">— select solved DB —</option></select>
+          <button class="btn btn-s" onclick="loadSolverDbs()">Refresh</button>
+          <button class="btn btn-s" onclick="loadSolverDbIntoMap(false)" title="Replace current solved positions with this DB">Load</button>
+          <button class="btn btn-s" onclick="loadSolverDbIntoMap(true)" title="Append this DB onto the current map">Append</button>
+          <button class="btn btn-s" onclick="document.getElementById('solver-db-import-input').click()">Import DB</button>
+          <input type="file" id="solver-db-import-input" accept=".sqlite,.db,.awdb" style="display:none" onchange="solverDbImportSelected(this)">
+        </div>
+      </div>
+      <div id="solver-db-note" style="font-size:.72rem;color:var(--mu);font-family:monospace;margin-top:.35rem">No solved DB loaded.</div>
+    </div>
   </div>
   <div style="flex:1;overflow:hidden;min-height:0;display:flex;flex-direction:column;padding:.5rem">
     <div class="log" id="sl-log" style="flex:1;height:auto;min-height:0"></div>
@@ -495,6 +522,7 @@ On: keep watching a growing capture file until Stop is pressed.">?</span>
         <button class="btn btn-s" onclick="loadSessions()">Refresh</button>
         <button class="btn btn-s" onclick="document.getElementById('sess-import-input').click()">↑ Import</button>
         <input type="file" id="sess-import-input" accept=".jsonl" multiple style="display:none" onchange="sessImportSelected(this)">
+        <label title="Optional: draw underconstrained evidence centroids on the map. They are not counted in the Positions tab." style="font-size:.72rem;color:var(--mu);display:flex;align-items:center;gap:.25rem"><input type="checkbox" id="sess-include-evidence"> evidence layer</label>
         <button class="btn btn-p" id="sess-solve-all-btn" onclick="solveAllSessions()">Solve All</button>
       </div>
     </div>

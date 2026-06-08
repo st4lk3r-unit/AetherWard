@@ -420,9 +420,14 @@ class TestWebFatSessionRegressions:
             got = json.loads(body)
             assert 2 <= len(got) <= 61
             assert all(r.get('overview') is True for r in got)
-            assert all(r.get('record_type') == 'gps' for r in got)
+            # Overview is a bounded route/coverage preview: GPS breadcrumbs plus
+            # sampled RF route rows, not GPS-only.  This avoids hiding capture
+            # areas where RF observations are geotagged but GPS breadcrumbs are
+            # sparse.
+            assert any(r.get('record_type') == 'gps' for r in got)
+            assert any(r.get('record_type') == 'route' for r in got)
             assert got[0]['t'] == rows[0]['t']
-            assert got[-1]['t'] == rows[-2]['t']
+            assert got[-1]['t'] in (rows[-1]['t'], rows[-2]['t'])
         finally:
             path.unlink(missing_ok=True)
 
