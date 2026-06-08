@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License](https://img.shields.io/badge/license-WTFPL-darkred?style=flat-square)
 [![Tests](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml/badge.svg)](https://github.com/st4lk3r-unit/AetherWard/actions/workflows/release.yml)
-![Version](https://img.shields.io/badge/version-0.3.3-orange?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.3.4-orange?style=flat-square)
 
 <p align="center"><sub><i>Knowledge should be free 🏴‍☠️</i></sub></p>
 

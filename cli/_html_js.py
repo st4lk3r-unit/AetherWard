@@ -2,6 +2,7 @@ _HTML_JS = r"""<script>
 // ── State ─────────────────────────────────────────────────────────────────────
 const srcs = {}, mkrs = {};
 const _relLines = {}, _sampleLines = [];
+let _confidenceCircle=null;
 const _sourceSamples = {}, _sourceSamplesByAp = {};
 const _networkRelations = {};
 const _sourceSampleFetches = {};
@@ -44,30 +45,81 @@ function tab(btn) {
   const name = btn.dataset.tab;
   document.getElementById('panel-'+name).classList.add('active');
   btn.classList.add('active');
-  if (name==='map')       { initMap(); if(map) map.invalidateSize(); refreshMapStats(); _renderPathsList(); _updatePathsToggleBtn(); }
+  if (name==='map')       { initMap(); if(map) map.invalidateSize(); _scheduleMapRender('tab-map'); refreshMapStats(); _renderPathsList(); _updatePathsToggleBtn(); }
   if (name==='positions') renderPositions();
   if (name==='enu')       { requestAnimationFrame(enuRender); }
   if (name==='tdoa3d')    { loadConfigs(); requestAnimationFrame(tdoa3dRender); }
   if (name==='sessions')  loadSessions();
   if (name==='configs')  loadConfigs();
-  if (name==='solve')    { loadSessions(); loadConfigs(); }
+  if (name==='solve')    { loadSessions(); loadConfigs(); loadSolverDbs(); }
   if (name==='run')      loadConfigs();
   if (name==='settings') {
     fetch('/api/status').then(r=>r.json()).then(d=>{
       const tb=document.getElementById('settings-sys-tb');
       if(tb) tb.innerHTML=Object.entries(d).map(([k,v])=>
-        `<tr><td style="color:var(--mu);width:160px">${k}</td><td>${v}</td></tr>`).join('');
+        `<tr><td style="color:var(--mu);width:160px">${_xmlEsc(k)}</td><td>${_fmtStatusValue(v)}</td></tr>`).join('');
     });
     loadDetect();
   }
+}
+
+function _fmtStatusValue(v){
+  if(v==null) return '—';
+  if(typeof v==='boolean') return v?'true':'false';
+  if(typeof v==='number') return Number.isFinite(v)?String(v):'—';
+  if(typeof v==='string') return _xmlEsc(v);
+  if(Array.isArray(v)) return _xmlEsc(v.join(', '));
+  if(typeof v==='object'){
+    const phase=v.phase||'idle';
+    const pct=Number(v.pct||0);
+    const txt=v.text||'';
+    const running=v.running?'running':'idle';
+    const bits=[];
+    bits.push(_xmlEsc(String(phase)));
+    if(Number.isFinite(pct)&&pct>0) bits.push(pct.toFixed(1)+'%');
+    bits.push(_xmlEsc(running));
+    if(txt) bits.push('<span style="color:var(--mu)">'+_xmlEsc(String(txt))+'</span>');
+    return bits.join(' · ');
+  }
+  return _xmlEsc(String(v));
 }
 
 // ── Map ───────────────────────────────────────────────────────────────────────
 // ── Map filter state ──────────────────────────────────────────────────────────
 let _mapFilter='all';
 let _mapRoleFilter='all', _mapShowRelations=true, _selectedSourceId=null;
-const _PATH_COLORS=['#ff3c3c','#3c9eff','#3cff6e','#ffcc3c','#cc3cff','#ff3c8e','#ff8c3c','#3cffee'];
+const _PATH_COLORS=['#ff3c3c','#3c9eff','#3cff6e','#ffcc3c','#cc3cff','#ff3c8e','#ff8c3c','#3cffee','#8cff3c','#3c6eff','#ff6e3c','#e0ff3c'];
+function _pathHash(s){
+  s=String(s||''); let h=2166136261;
+  for(let i=0;i<s.length;i++){h^=s.charCodeAt(i); h=Math.imul(h,16777619);}
+  return h>>>0;
+}
+function _stablePathColor(key){
+  return _PATH_COLORS[_pathHash(String(key||'')) % _PATH_COLORS.length];
+}
+function _parseSolverPathKey(path){
+  const s=String(path||'');
+  if(!s.startsWith('solverdb:')) return null;
+  const rest=s.slice('solverdb:'.length);
+  const idx=rest.indexOf('#');
+  if(idx<0) return {db:rest, session_path:'', path_key:s};
+  const db=rest.slice(0,idx);
+  const tail=rest.slice(idx+1);
+  if(tail.startsWith('samples:')) return {db, sample_id:tail.slice(8), session_path:'', path_key:s};
+  return {db, session_path:tail, path_key:'solverdb:'+db+'#'+tail};
+}
 let _loadedPaths=[];
+let _clusterEnabled=true, _clusterMarkers=[], _clusterTimer=null;
+let _mapRenderTimer=null, _lastMapRenderReason='', _mapIsClustered=false, _lastRenderStats=null;
+let _pathDotsEnabled=false;  // path dots are expensive; keep route polylines by default
+let _relationshipTimer=null;
+let _pendingPositionRecords=[], _positionFlushTimer=null;
+const _REAL_POSITION_METHODS=new Set(['rss_trilateration','rssi_centroid','tdoa','manual']);
+function _isRealPositionRow(rec){
+  const m=String(rec?.pos_method||'');
+  if(!rec||rec.unsolved||m==='observation_centroid'||m==='session_sample_centroid') return false;
+  return _REAL_POSITION_METHODS.has(m)||(!m&&rec.lat!=null&&rec.lon!=null);
+}
 
 function _updateMapCenter(){
   if(!map) return;
@@ -114,11 +166,10 @@ function initMap() {
     map.getPane('aw-samples').style.zIndex = 460;
   }
   map.on('move',_updateMapCenter);
-  map.on('moveend zoomend',()=>{_refreshRelationshipLines();refreshMapStats();});
+  map.on('moveend zoomend',()=>{_scheduleMapRender('view-change');});
   map.on('click',_clearSampleLines);
   _updateMapCenter();
-  Object.values(srcs).forEach(updateMarker);
-  _refreshRelationshipLines();
+  _scheduleMapRender('init');
   // Activate saved button after DOM is ready
   document.querySelectorAll('.tile-btn').forEach(b => b.classList.toggle('tile-btn-active', b.dataset.tile === saved));
 }
@@ -139,7 +190,7 @@ const _REC_ALIASES={
   client:['client','station','sta','linked_client'],
   station:['station','client','sta','linked_client'],
   source_role:['source_role','role','kind'],
-  id:['id','identifier','mac','bssid','client','station'],
+  id:['id','source_id','identifier','mac','bssid','client','station'],
   identifier:['identifier','id','mac','bssid','client','station'],
 };
 function _directRecVal(rec,k){
@@ -177,7 +228,9 @@ function _srcRole(rec){
 }
 function _roleColor(role){return role==='ap'?'#a855f7':role==='client'?'#00d4c8':'#706082';}
 function _roleLabel(role){return role==='ap'?'AP':role==='client'?'Client':'Other';}
-function _sourcePrimaryId(rec){return _normId(_directRecVal(rec,'id')||_directRecVal(rec,'identifier')||_directRecVal(rec,'client')||_directRecVal(rec,'station')||_directRecVal(rec,'bssid'));}
+function _sourcePrimaryId(rec){return _normId(_directRecVal(rec,'source_id')||_directRecVal(rec,'identifier')||_directRecVal(rec,'client')||_directRecVal(rec,'station')||_directRecVal(rec,'bssid')||_directRecVal(rec,'id'));}
+function _sourceDisplayId(rec){return _sourcePrimaryId(rec)||_normId(_directRecVal(rec,'id')||_directRecVal(rec,'bssid'))||'?';}
+function _markerKey(rec){return String(_directRecVal(rec,'id')||_directRecVal(rec,'bssid')||'?');}
 function _apIdFor(rec){
   const id=_sourcePrimaryId(rec);
   let ap=_normId(_firstSpecificRecVal(rec,['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap']));
@@ -189,7 +242,7 @@ function _apIdFor(rec){
   return '';
 }
 function _candidateIds(rec){
-  return [_directRecVal(rec,'id'),_directRecVal(rec,'identifier'),_directRecVal(rec,'bssid'),_directRecVal(rec,'client'),_directRecVal(rec,'station'),_directRecVal(rec,'mac')]
+  return [_directRecVal(rec,'source_id'),_directRecVal(rec,'identifier'),_directRecVal(rec,'bssid'),_directRecVal(rec,'client'),_directRecVal(rec,'station'),_directRecVal(rec,'mac'),_directRecVal(rec,'id')]
     .map(_normId).filter(v=>v&&!_badId(v));
 }
 function _findSourceByMac(mac, wantRole){
@@ -227,7 +280,7 @@ function _markerVisible(rec){
   if(_mapSearchSSID&&!(rec.ssid||'').toLowerCase().includes(_mapSearchSSID.toLowerCase())) return false;
   if(_mapSearchMAC){
     const q=_mapSearchMAC.toLowerCase();
-    const hay=['id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(rec,k)||'').toLowerCase()).join(' ');
+    const hay=['id','source_id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(rec,k)||'').toLowerCase()).join(' ');
     if(!hay.includes(q)) return false;
   }
   if(_mapSearchRadius>0&&_mapSearchCenter&&rec.lat&&rec.lon){
@@ -237,13 +290,8 @@ function _markerVisible(rec){
 }
 function applyMapFilters(){
   if(!map) return;
-  Object.entries(mkrs).forEach(([id,mk])=>{
-    const rec=srcs[id]; if(!rec) return;
-    if(_markerVisible(rec)) mk.addTo(map); else mk.remove();
-  });
-  _refreshRelationshipLines();
-  if(_selectedSourceId) _showSourceSamples(_selectedSourceId);
-  refreshMapStats();
+  if(_selectedSourceId&&srcs[_selectedSourceId]&&!_markerVisible(srcs[_selectedSourceId])) _clearSampleLines();
+  _scheduleMapRender('filter-change', true);
 }
 function setRadiusCenter(){
   if(!map){alert('Open the Map tab first.');return;}
@@ -296,7 +344,7 @@ function _hydrateMapSearchSource(){
   if(_mapSearchHydrated[key]==='loading'||_mapSearchHydrated[key]==='done') return;
   // If the source is already present in solved markers, filtering was enough.
   const already=Object.values(srcs).some(r=>{
-    const hay=['id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(r,k)||'').toLowerCase()).join(' ');
+    const hay=['id','source_id','identifier','bssid','associated_bssid','client','station','linked_client','ssid'].map(k=>String(_recVal(r,k)||'').toLowerCase()).join(' ');
     return hay.includes(key);
   });
   if(already) return;
@@ -331,7 +379,7 @@ function _hydrateMapSearchSource(){
 
 function _recordSourceId(r){
   const m=r.metadata||{};
-  return String(r.id||r.identifier||m.identifier||m.id||m.bssid||m.station||m.client||r.bssid||r.station||r.client||r.mac||m.mac||'');
+  return String(r.source_id||m.source_id||r.identifier||m.identifier||m.id||m.bssid||m.station||m.client||r.id||r.bssid||r.station||r.client||r.mac||m.mac||'');
 }
 function _recordApId(r){
   const ap=_normId(_firstSpecificRecVal(r,['associated_bssid','associated','associated_ap','ap_bssid','ap_mac','ap']));
@@ -384,16 +432,23 @@ function _indexRelationsFromRecords(path,recs){
 }
 function _indexSamplesFromRecords(path,recs,opts){
   opts=opts||{};
-  const replace=opts.replace!==false;
-  // Rebuild only entries for this path, so reloading a session does not double-count dots.
-  if(replace){
-    for(const bucket of [_sourceSamples,_sourceSamplesByAp]){
-      Object.keys(bucket).forEach(k=>{bucket[k]=(bucket[k]||[]).filter(s=>s.path!==path&&!String(s.path||'').startsWith(path+'#')); if(!bucket[k].length) delete bucket[k];});
-    }
+  if(opts.replace){
+    // Remove only buckets created by this fetch.  Do not wipe samples loaded
+    // from a different session/DB that happen to belong to the same AP.
+    Object.keys(_sourceSamples).forEach(k=>{_sourceSamples[k]=(_sourceSamples[k]||[]).filter(s=>s.fetch_path!==path); if(!_sourceSamples[k].length) delete _sourceSamples[k];});
+    Object.keys(_sourceSamplesByAp).forEach(k=>{_sourceSamplesByAp[k]=(_sourceSamplesByAp[k]||[]).filter(s=>s.fetch_path!==path); if(!_sourceSamplesByAp[k].length) delete _sourceSamplesByAp[k];});
   }
-  recs.forEach((r,i)=>{
-    if((r.record_type==='gps'||r.source==='gps')||r.lat==null||r.lon==null) return;
-    const sample={path,lat:+r.lat,lon:+r.lon,t:r.t||0,rssi:r.rssi??null,idx:i};
+  const m=String(path||'').match(/^solverdb:(.+?)#samples:/);
+  const solverDb=m?m[1]:'';
+  (recs||[]).forEach((r,i)=>{
+    if(r.lat==null||r.lon==null) return;
+    const sessionPath=String(r.session_path||r.path||'');
+    const colorPath=(solverDb&&sessionPath)?('solverdb:'+solverDb+'#'+sessionPath):sessionPath||path;
+    const sample={
+      path:colorPath, fetch_path:path,
+      lat:+r.lat,lon:+r.lon,t:r.t||0,rssi:r.rssi??null,idx:i,
+      count:r.count||r.samples||1
+    };
     const sid=_recordSourceId(r);
     _addSampleIndex(sid,sample);
     const ap=_recordApId(r);
@@ -410,12 +465,36 @@ function _uniqSamples(samples){
   return out;
 }
 function _baseSamplePath(path){
-  return String(path||'').split('#')[0];
+  const s=String(path||'');
+  const parsed=_parseSolverPathKey(s);
+  if(parsed&&parsed.session_path) return parsed.session_path;
+  return s.split('#')[0];
 }
 function _colorForSamplePath(path){
-  const base=_baseSamplePath(path);
-  const hit=_loadedPaths.find(p=>p.path===base);
-  return hit?.color || '#ff2020';
+  const s=String(path||'');
+  const direct=_loadedPaths.find(p=>p.path===s);
+  if(direct) return direct.color;
+
+  // DB sample cells store paths as solverdb:<db>#<session_path>.  Match that
+  // against DB-loaded route previews, raw route previews, and finally fall back
+  // to the exact same deterministic session colour used when a path is loaded.
+  const parsed=_parseSolverPathKey(s);
+  if(parsed&&parsed.session_path){
+    const hit=_loadedPaths.find(p=>
+      p.path===parsed.path_key ||
+      (p.solver_db_path===parsed.db && p.session_path===parsed.session_path) ||
+      p.session_path===parsed.session_path ||
+      p.path===parsed.session_path
+    );
+    return hit?.color || _stablePathColor(parsed.session_path);
+  }
+
+  // Raw-session sample fetches use path#samples:<source>.  Strip that suffix and
+  // match either an exact raw path or a DB route preview whose session_path is
+  // the same raw path.
+  const raw=s.replace(/#samples:.+$/,'');
+  const hit=_loadedPaths.find(p=>p.path===raw||p.session_path===raw);
+  return hit?.color || _stablePathColor(raw||s);
 }
 function _samplesForSource(rec){
   if(!rec) return [];
@@ -428,11 +507,41 @@ function _samplesForSource(rec){
 }
 function _clearSampleLines(){
   _sampleLines.splice(0).forEach(l=>l.remove());
+  if(_confidenceCircle){try{_confidenceCircle.remove();}catch(e){} _confidenceCircle=null;}
   _selectedSourceId=null;
   Object.entries(mkrs).forEach(([id,m])=>{const rec=srcs[id]; if(rec)m.setIcon(mkIcon(rec,false));});
   const stat=document.getElementById('map-link-count'); if(stat) stat.textContent='No selected source';
   refreshMapStats();
 }
+function _confidenceRadiusFor(rec){
+  if(!rec) return 0;
+  const explicit=Number(rec.confidence_radius_m||rec.error_radius_m||rec.accuracy_m||rec.radius_m||0);
+  if(Number.isFinite(explicit)&&explicit>0) return Math.max(1,Math.min(5000,explicit));
+  if(rec.residual_m!=null){const r=Number(rec.residual_m); if(Number.isFinite(r)&&r>0) return Math.max(3,Math.min(5000,r));}
+  const cells=Math.max(1,Number(rec.sample_cells||rec.samples||1));
+  const res=Number(rec.residual_dBm||rec.rss_residual||0);
+  if(String(rec.pos_method||'')==='rss_trilateration'){
+    const v=10 + (Number.isFinite(res)?Math.max(0,res)*7:25) + 45/Math.sqrt(cells);
+    return Math.max(6,Math.min(400,v));
+  }
+  if(String(rec.pos_method||'')==='rssi_centroid'){
+    const v=35 + (Number.isFinite(res)?Math.max(0,res)*10:45) + 80/Math.sqrt(cells);
+    return Math.max(15,Math.min(800,v));
+  }
+  return 0;
+}
+function _drawConfidenceCircle(rec){
+  if(!map) return;
+  if(_confidenceCircle){try{_confidenceCircle.remove();}catch(e){} _confidenceCircle=null;}
+  const rad=_confidenceRadiusFor(rec);
+  if(!rec||!Number.isFinite(rad)||rad<=0||rec.lat==null||rec.lon==null) return;
+  const color=mkColor(rec.pos_method);
+  _confidenceCircle=L.circle([+rec.lat,+rec.lon],{
+    radius:rad,color,fillColor:color,fillOpacity:.08,opacity:.72,weight:1.8,
+    dashArray:String(rec.pos_method)==='rssi_centroid'?'6 6':'4 4',interactive:false
+  }).addTo(map);
+}
+
 function _updateSelectedSampleStat(){
   const stat=document.getElementById('map-link-count'); if(!stat) return;
   if(!_selectedSourceId){stat.textContent='No selected source';return;}
@@ -442,7 +551,7 @@ function _updateSelectedSampleStat(){
   const samples=_samplesForSource(rec);
   const inView=samples.filter(s=>_pointInCurrentView(s.lat,s.lon)).length;
   if(samples.length) stat.textContent=`${inView}/${samples.length} selected sample link${samples.length!==1?'s':''} in view`;
-  else if(_sourceSampleFetches[key]==='loading') stat.textContent='Loading linked samples…';
+  else if(Object.entries(_sourceSampleFetches).some(([k,v])=>v==='loading'&&k.includes(key))) stat.textContent='Loading linked samples…';
   else stat.textContent='No linked samples loaded';
 }
 function _drawSourceSampleLines(id){
@@ -450,51 +559,89 @@ function _drawSourceSampleLines(id){
   const rec=srcs[id];
   if(!rec||!rec.lat||!rec.lon||!_markerVisible(rec)){_clearSampleLines();return;}
   Object.entries(mkrs).forEach(([mid,m])=>{const r=srcs[mid]; if(r)m.setIcon(mkIcon(r,mid===id));});
-  const samples=_samplesForSource(rec);
-  samples.forEach(s=>{
+  _drawConfidenceCircle(rec);
+  let samples=_samplesForSource(rec);
+  const bounds=_paddedMapBounds();
+  const total=samples.length;
+  if(bounds){
+    const vis=samples.filter(s=>bounds.contains([s.lat,s.lon]));
+    // Draw what is relevant to the current viewport first.  Thousands of sample
+    // lines are a self-inflicted Leaflet DoS; the DB still contains them, but
+    // the map materializes a bounded view of them.
+    samples=vis.length?vis:samples;
+  }
+  const DRAW_CAP=700;
+  const drawn=samples.slice(0,DRAW_CAP);
+  drawn.forEach(s=>{
     const color=_colorForSamplePath(s.path);
     const line=L.polyline([[rec.lat,rec.lon],[s.lat,s.lon]],{pane:'aw-samples',color,weight:1.6,opacity:.68,interactive:false}).addTo(map);
     const dot=L.circleMarker([s.lat,s.lon],{pane:'aw-samples',radius:3,color,fillColor:color,fillOpacity:.9,weight:1,interactive:false}).addTo(map);
     _sampleLines.push(line,dot);
   });
+  if(total>DRAW_CAP) sysLog(`Sample links draw capped: ${drawn.length}/${total}. Zoom in to inspect denser local samples.`);
   _updateSelectedSampleStat();
   refreshMapStats();
 }
 function _loadSamplesForSource(id,rec){
   const key=_sourcePrimaryId(rec)||_normId(id);
-  if(!key||_sourceSampleFetches[key]==='loading'||_sourceSampleFetches[key]==='done') return Promise.resolve();
-  const paths=[...new Set(_loadedPaths.map(p=>p.path).filter(Boolean))];
-  if(!paths.length) return Promise.resolve();
-  _sourceSampleFetches[key]='loading';
+  const fetchKey=(rec.solver_db_path?('db:'+rec.solver_db_path+':'+(rec.id||id)):('raw:'+key));
+  if(!key||_sourceSampleFetches[fetchKey]==='loading'||_sourceSampleFetches[fetchKey]==='done') return Promise.resolve();
+  _sourceSampleFetches[fetchKey]='loading';
   _updateSelectedSampleStat();
   const role=_srcRole(rec);
   let chain=Promise.resolve();
-  paths.forEach(path=>{
-    chain=chain.then(()=>{
-      const u='/api/session/source_samples?path='+encodeURIComponent(path)+'&source='+encodeURIComponent(key)+'&role='+encodeURIComponent(role)+'&max_obs=1500';
-      return fetch(u).then(r=>r.json()).then(rows=>{
-        if(Array.isArray(rows)&&rows.length){
-          _indexSamplesFromRecords(path+'#samples:'+key,rows,{replace:true});
-          _refreshRelationshipLines();
-        }
-      }).catch(()=>{});
+
+  // Solved DB rows are self-contained: sample cells used by the solver are
+  // loaded directly from ~/.aetherward/solver/*.sqlite.  This avoids rescanning
+  // 80 MB JSONL files just because the user clicked one AP/client marker.
+  if(rec.solver_db_path){
+    const db=rec.solver_db_path;
+    const pid=rec.id||id;
+    const u='/api/solver/source_samples?db='+encodeURIComponent(db)+'&position_id='+encodeURIComponent(pid)+'&max_obs=1500';
+    chain=chain.then(()=>fetch(u).then(r=>r.json()).then(rows=>{
+      if(Array.isArray(rows)&&rows.length){
+        _indexSamplesFromRecords('solverdb:'+db+'#samples:'+pid,rows,{replace:true});
+        sysLog('Loaded '+rows.length+' solver-DB sample cell(s) for selected source.');
+        _refreshRelationshipLines();
+      } else {
+        sysLog('No solver-DB sample cells for selected source; DB may be from an older run or still committing.');
+      }
+    }).catch(err=>{sysLog('Solver-DB sample lookup failed: '+err);}));
+  } else {
+    const paths=[...new Set(_loadedPaths.map(p=>p.path).filter(Boolean))];
+    if(!paths.length){_sourceSampleFetches[key]='done';return Promise.resolve();}
+    paths.forEach(path=>{
+      chain=chain.then(()=>{
+        const u='/api/session/source_samples?path='+encodeURIComponent(path)+'&source='+encodeURIComponent(key)+'&role='+encodeURIComponent(role)+'&max_obs=1500';
+        return fetch(u).then(r=>r.json()).then(rows=>{
+          if(Array.isArray(rows)&&rows.length){
+            _indexSamplesFromRecords(path+'#samples:'+key,rows,{replace:true});
+            _refreshRelationshipLines();
+          }
+        }).catch(()=>{});
+      });
     });
-  });
-  return chain.finally(()=>{_sourceSampleFetches[key]='done'; if(_selectedSourceId===id)_drawSourceSampleLines(id);});
+  }
+  return chain.finally(()=>{_sourceSampleFetches[fetchKey]='done'; if(_selectedSourceId===id)_drawSourceSampleLines(id);});
 }
 function _showSourceSamples(id){
   if(!map) return;
   const rec=srcs[id];
   if(!rec||!rec.lat||!rec.lon||!_markerVisible(rec)){_clearSampleLines();return;}
   _selectedSourceId=id;
+  // Do not disable virtual clustering for the whole map just because one source
+  // is selected.  Materialize only that selected marker; the rest may remain
+  // clustered.  This avoids the “clicked one AP → 2000 hidden markers” lag.
+  _ensureMarker(id,rec,true);
   _drawSourceSampleLines(id);
   if(!_samplesForSource(rec).length) _loadSamplesForSource(id,rec);
+  _scheduleMapRender('selected-source');
 }
 function _visibleSourceRec(rec){
   return !!(rec&&rec.lat!=null&&rec.lon!=null&&_markerVisible(rec)&&_sourceShownInCurrentView(rec));
 }
 function _relationIdFor(rec){
-  return _normId(_recVal(rec,'id')||_recVal(rec,'identifier')||_recVal(rec,'bssid')||_recVal(rec,'client')||_recVal(rec,'station'));
+  return _sourcePrimaryId(rec);
 }
 function _addRelationLine(keep, a, b, label){
   if(!map||!_visibleSourceRec(a)||!_visibleSourceRec(b)) return;
@@ -507,28 +654,172 @@ function _addRelationLine(keep, a, b, label){
   else _relLines[key]=L.polyline(latlngs,{pane:'aw-relations',color:'#ff8c42',weight:2.2,opacity:.88,dashArray:'5 5',interactive:false}).addTo(map);
   try{_relLines[key].bringToFront();}catch(e){}
 }
+function _scheduleRelationshipRefresh(){
+  if(_relationshipTimer) return;
+  _relationshipTimer=setTimeout(()=>{_relationshipTimer=null;_refreshRelationshipLines();},250);
+}
 function _refreshRelationshipLines(){
   if(!map) return;
   const keep=new Set();
-  if(_mapShowRelations){
-    Object.entries(srcs).forEach(([sid,rec])=>{
-      _relationPairsFromRecord(rec).forEach(pair=>{
-        const client=_findSourceByMac(pair.client,'client');
-        const ap=_findSourceByMac(pair.ap,'ap');
-        if(client&&ap) _addRelationLine(keep, client, ap, 'traffic');
-      });
-    });
-    Object.values(_networkRelations).forEach(list=>{
-      (list||[]).forEach(pair=>{
-        const client=_findSourceByMac(pair.client,'client');
-        const ap=_findSourceByMac(pair.ap,'ap');
-        if(client&&ap) _addRelationLine(keep, client, ap, 'indexed');
-      });
-    });
+  // Relations are meaningful only between materialized individual markers.  In
+  // virtual-cluster overview, scanning every source for AP/client relations is
+  // pure compute lag and often invisible anyway.
+  if(!_mapShowRelations || _mapIsClustered){
+    Object.keys(_relLines).forEach(k=>{_relLines[k].remove();delete _relLines[k];});
+    refreshMapStats();
+    return;
   }
+  const visible=[];
+  Object.entries(mkrs).forEach(([id,m])=>{
+    const rec=srcs[id];
+    if(rec&&map.hasLayer(m)&&_pointInCurrentView(rec.lat,rec.lon)) visible.push(rec);
+  });
+  if(!visible.length){
+    Object.keys(_relLines).forEach(k=>{_relLines[k].remove();delete _relLines[k];});
+    refreshMapStats();
+    return;
+  }
+  const byId=new Map();
+  visible.forEach(rec=>_candidateIds(rec).forEach(v=>{if(!byId.has(v)) byId.set(v,rec);}));
+  const findVis=(mac,wantRole)=>{
+    const n=_normId(mac); if(!n||_badId(n)) return null;
+    const rec=byId.get(n); if(!rec) return null;
+    return (!wantRole||_srcRole(rec)===wantRole||_srcRole(rec)==='unknown')?rec:null;
+  };
+  visible.forEach(rec=>{
+    _relationPairsFromRecord(rec).forEach(pair=>{
+      const client=findVis(pair.client,'client');
+      const ap=findVis(pair.ap,'ap');
+      if(client&&ap) _addRelationLine(keep, client, ap, 'traffic');
+    });
+  });
+  Object.values(_networkRelations).forEach(list=>{
+    (list||[]).forEach(pair=>{
+      const client=findVis(pair.client,'client');
+      const ap=findVis(pair.ap,'ap');
+      if(client&&ap) _addRelationLine(keep, client, ap, 'indexed');
+    });
+  });
   Object.keys(_relLines).forEach(k=>{if(!keep.has(k)){_relLines[k].remove();delete _relLines[k];}});
   refreshMapStats();
 }
+
+function _clearClusterMarkers(){
+  _clusterMarkers.splice(0).forEach(m=>{try{m.remove();}catch(e){}});
+}
+function toggleMapClusters(btn){
+  _clusterEnabled=!_clusterEnabled;
+  if(btn){btn.textContent=_clusterEnabled?'Clusters ●':'Clusters ○';btn.style.opacity=_clusterEnabled?'1':'.5';}
+  _scheduleMapRender('toggle-clusters', true);
+}
+function _scheduleClusterRefresh(){ _scheduleMapRender('cluster-refresh'); }
+function _scheduleMapRender(reason, immediate){
+  _lastMapRenderReason=reason||_lastMapRenderReason||'render';
+  if(!map) return;
+  if(_mapRenderTimer){ if(!immediate) return; clearTimeout(_mapRenderTimer); _mapRenderTimer=null; }
+  const run=()=>{_mapRenderTimer=null; _renderMapObjects(_lastMapRenderReason);};
+  if(immediate) requestAnimationFrame(run);
+  else _mapRenderTimer=setTimeout(()=>requestAnimationFrame(run),80);
+}
+function _clusterIcon(n){
+  const sz=n>=100?38:n>=25?32:27;
+  return L.divIcon({className:'',html:`<div style="width:${sz}px;height:${sz}px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(255,60,60,.88);border:2px solid #ffd0d0;color:#100;font-weight:800;font-size:${n>=100?'.72rem':'.78rem'};box-shadow:0 0 14px rgba(255,60,60,.55)">${n}</div>`,iconSize:[sz,sz],iconAnchor:[Math.round(sz/2),Math.round(sz/2)]});
+}
+function _mapCandidateEntries(){
+  const entries=[];
+  Object.entries(srcs).forEach(([id,rec])=>{
+    if(!rec||rec.lat==null||rec.lon==null||!_markerVisible(rec)) return;
+    const la=+rec.lat, lo=+rec.lon;
+    if(!Number.isFinite(la)||!Number.isFinite(lo)) return;
+    entries.push({id,rec,lat:la,lon:lo});
+  });
+  return entries;
+}
+function _paddedMapBounds(){
+  if(!map) return null;
+  try{return map.getBounds().pad(0.22);}catch(e){return null;}
+}
+function _shouldUseVirtualClusters(entries){
+  if(!map||!_clusterEnabled) return false;
+  return entries.length>450 && map.getZoom()<17;
+}
+function _ensureMarker(id,rec,quiet){
+  if(!map||!rec||rec.lat==null||rec.lon==null) return null;
+  // Reuse updateMarker's popup/icon semantics for individual markers, but do not
+  // let a batch of thousands force repeated cluster/relation/stat recomputation.
+  return updateMarker(rec,{quiet:!!quiet});
+}
+function _removeMarker(id){
+  if(mkrs[id]){try{mkrs[id].remove();}catch(e){} delete mkrs[id];}
+}
+function _renderMapObjects(reason){
+  if(!map) return;
+  const t0=performance.now();
+  const entries=_mapCandidateEntries();
+  const bounds=_paddedMapBounds();
+  const useClusters=_shouldUseVirtualClusters(entries);
+  _mapIsClustered=useClusters;
+  _clearClusterMarkers();
+
+  if(useClusters){
+    // Virtual clustering: source markers are not created and then hidden.  The
+    // map owns only cluster bubbles plus, at most, the currently selected source.
+    Object.keys(mkrs).forEach(id=>{ if(id!==_selectedSourceId) _removeMarker(id); });
+    const z=map.getZoom();
+    const cellPx=z<13?88:z<15?68:50;
+    const buckets=new Map();
+    entries.forEach(o=>{
+      if(bounds&&!bounds.contains([o.lat,o.lon])) return;
+      try{
+        const p=map.latLngToLayerPoint([o.lat,o.lon]);
+        const k=Math.floor(p.x/cellPx)+','+Math.floor(p.y/cellPx);
+        let b=buckets.get(k);
+        if(!b){b={items:[],lat:0,lon:0};buckets.set(k,b);}
+        b.items.push(o); b.lat+=o.lat; b.lon+=o.lon;
+      }catch(e){}
+    });
+    buckets.forEach(b=>{
+      const n=b.items.length; if(!n) return;
+      const selectedInside=_selectedSourceId && b.items.some(o=>o.id===_selectedSourceId);
+      if(n===1 && entries.length<900){ _ensureMarker(b.items[0].id,b.items[0].rec,true); return; }
+      const lat=b.lat/n, lon=b.lon/n;
+      const cm=L.marker([lat,lon],{icon:_clusterIcon(n),zIndexOffset:900});
+      const rss=b.items.filter(o=>o.rec.pos_method==='rss_trilateration').length;
+      const cen=b.items.filter(o=>o.rec.pos_method==='rssi_centroid').length;
+      const ap=b.items.filter(o=>_srcRole(o.rec)==='ap').length;
+      const cli=b.items.filter(o=>_srcRole(o.rec)==='client').length;
+      cm.bindPopup(`<b>${n} grouped source positions</b><br><span style="color:var(--mu)">RSS:</span> ${rss} &nbsp; <span style="color:var(--mu)">Centroid:</span> ${cen}<br><span style="color:var(--mu)">AP:</span> ${ap} &nbsp; <span style="color:var(--mu)">Clients:</span> ${cli}<br><small style="color:var(--mu)">This is one Leaflet object. Source records are not merged; zoom in or click to expand.</small>`,{maxWidth:280});
+      cm.on('click',()=>{
+        // Avoid creating hundreds of temporary markers just to compute bounds.
+        let minLat=Infinity,maxLat=-Infinity,minLon=Infinity,maxLon=-Infinity;
+        b.items.forEach(o=>{minLat=Math.min(minLat,o.lat);maxLat=Math.max(maxLat,o.lat);minLon=Math.min(minLon,o.lon);maxLon=Math.max(maxLon,o.lon);});
+        try{map.fitBounds([[minLat,minLon],[maxLat,maxLon]],{padding:[36,36],maxZoom:18});}
+        catch(e){map.setView([lat,lon],Math.min(19,map.getZoom()+2));}
+      });
+      cm.addTo(map); _clusterMarkers.push(cm);
+      if(selectedInside){const rec=srcs[_selectedSourceId]; if(rec) _ensureMarker(_selectedSourceId,rec,true);}
+    });
+  } else {
+    const wanted=new Set();
+    entries.forEach(o=>{
+      if(bounds && entries.length>1200 && !bounds.contains([o.lat,o.lon])) return;
+      wanted.add(o.id); _ensureMarker(o.id,o.rec,true);
+    });
+    Object.keys(mkrs).forEach(id=>{ if(!wanted.has(id)) _removeMarker(id); });
+  }
+  if(_selectedSourceId&&srcs[_selectedSourceId]&&mkrs[_selectedSourceId]){
+    try{mkrs[_selectedSourceId].setIcon(mkIcon(srcs[_selectedSourceId],true));}catch(e){}
+  }
+  _refreshRelationshipLines();
+  refreshMapStats();
+  const dt=performance.now()-t0;
+  _lastRenderStats={reason,dt,stored:entries.length,clusters:_clusterMarkers.length,markers:Object.keys(mkrs).length,paths:_loadedPaths.length,sampleObjects:_sampleLines.length};
+  if(dt>180 || (reason && entries.length>1200 && (reason==='solver-db-load'||reason==='bulk-reconcile'))){
+    sysLog(`Map render ${dt.toFixed(0)} ms (${reason||'render'}): ${entries.length} candidate(s), ${_clusterMarkers.length} cluster(s), ${Object.keys(mkrs).length} marker(s), ${_sampleLines.length} sample object(s).`);
+  }
+}
+function _refreshClusters(force){ _scheduleMapRender('cluster-refresh', !!force); }
+
 function setMapRoleFilter(btn){
   _mapRoleFilter=btn.dataset.role;
   document.querySelectorAll('.mfpill-role').forEach(b=>b.classList.toggle('active',b===btn));
@@ -539,9 +830,10 @@ function toggleMapRelations(btn){
   if(btn){btn.textContent=_mapShowRelations?'Relations ●':'Relations ○';btn.style.opacity=_mapShowRelations?'1':'.5';}
   _refreshRelationshipLines();
 }
-function updateMarker(rec){
-  if(!map||!rec.lat||!rec.lon)return;
-  const id=String(rec.id||rec.bssid||'?'), lbl=_displaySSID(rec.ssid||'').slice(0,36);
+function updateMarker(rec,opts){
+  opts=opts||{};
+  if(!map||!rec.lat||!rec.lon)return null;
+  const id=_markerKey(rec), sid=_sourceDisplayId(rec), lbl=_displaySSID(rec.ssid||'').slice(0,36);
   const role=_srcRole(rec), roleTxt=_roleLabel(role), apId=_apIdFor(rec);
   const res=rec.residual_dBm!=null?`<span style="color:var(--ylw)">Residual:</span> ${rec.residual_dBm} dB<br>`:
             rec.residual_m!=null?`<span style="color:var(--ylw)">Residual:</span> ${(+rec.residual_m).toFixed(2)} m<br>`:
@@ -549,11 +841,13 @@ function updateMarker(rec){
   rec.ssid=_cleanSSID(rec.ssid);
   const sec=rec.auth_mode||rec.security||'';
   const ch=rec.channel?` &nbsp; <span style="color:var(--mu)">Ch:</span> ${_xmlEsc(rec.channel)}`:'';
-  const bssid=rec.bssid&&rec.bssid!==id?`<span style="color:var(--mu)">BSSID/AP:</span> ${_xmlEsc(rec.bssid)}<br>`:'';
+  const bssid=rec.bssid&&_normId(rec.bssid)!==_normId(sid)?`<span style="color:var(--mu)">BSSID/AP:</span> ${_xmlEsc(rec.bssid)}<br>`:'';
   const linkedClient=_recVal(rec,'linked_client');
   const rel=role==='client'&&apId?`<span style="color:var(--mu)">Linked AP:</span> ${_xmlEsc(apId)}<br>`:
             linkedClient?`<span style="color:var(--mu)">Linked client:</span> ${_xmlEsc(linkedClient)}<br>`:'';
   const samples=_samplesForSource(rec).length;
+  const confRad=_confidenceRadiusFor(rec);
+  const conf=confRad?`<span style="color:var(--mu)">Confidence radius:</span> ≈${confRad.toFixed(confRad>=100?0:1)} m<br>`:'';
   const detail=[
     `<span style="color:var(--mu)">Role:</span> <b style="color:${_roleColor(role)}">${roleTxt}</b><br>`,
     sec?`<span style="color:var(--mu)">Auth:</span> <b>${_xmlEsc(sec)}</b><br>`:'',
@@ -562,10 +856,11 @@ function updateMarker(rec){
     Array.isArray(rec.akm_suites)&&rec.akm_suites.length?`<span style="color:var(--mu)">AKM:</span> ${_xmlEsc(rec.akm_suites.join(', '))}<br>`:'',
     Array.isArray(rec.pairwise_ciphers)&&rec.pairwise_ciphers.length?`<span style="color:var(--mu)">Cipher:</span> ${_xmlEsc(rec.pairwise_ciphers.join(', '))}<br>`:'',
   ].join('');
-  const pop=`<b>${_xmlEsc(lbl)}</b><br><small style="color:var(--mu)">${_xmlEsc(id)}</small><br>${bssid}${rel}${detail}
+  const sess=rec.session_name?`<br><small style="color:var(--mu)">Session: ${_xmlEsc((rec.session_folder?rec.session_folder+'/':'')+rec.session_name)}</small>`:'';
+  const pop=`<b>${_xmlEsc(lbl)}</b><br><small style="color:var(--mu)">${_xmlEsc(sid)}</small>${sess}<br>${bssid}${rel}${detail}
     <span style="color:var(--mu)">Method:</span> <b style="color:var(--acc)">${_xmlEsc(rec.pos_method||'?')}</b><br>
     ${(+rec.lat).toFixed(6)}, ${(+rec.lon).toFixed(6)}<br>
-    <span style="color:var(--mu)">Samples:</span> ${rec.samples||'?'} &nbsp;
+    ${conf}<span style="color:var(--mu)">Samples:</span> ${rec.samples||'?'} &nbsp;
     <span style="color:var(--mu)">Linked dots:</span> ${samples} &nbsp;
     <span style="color:var(--mu)">Freq:</span> ${rec.freq_mhz||'?'} MHz${ch}<br>${res}
     <a href="#" onclick="_showSourceSamples('${esc(id)}');return false" style="color:var(--acc);font-size:.78rem">Show sample links</a>
@@ -574,11 +869,13 @@ function updateMarker(rec){
   else{
     mkrs[id]=L.marker([rec.lat,rec.lon],{icon:mkIcon(rec,_selectedSourceId===id)}).addTo(map).bindPopup(pop);
     mkrs[id].on('click',e=>{if(e&&e.originalEvent)L.DomEvent.stopPropagation(e);_showSourceSamples(id);});
-    map.panTo([rec.lat,rec.lon]);
+    // Do not pan the map for every marker in a bulk solve; that turns thousands
+    // of valid positions into a UI denial-of-service. Manual pins still recentre.
+    if(rec.pos_method==='manual'&&!rec.session_path) map.panTo([rec.lat,rec.lon]);
   }
   if(!_markerVisible(rec)) mkrs[id].remove();
-  _refreshRelationshipLines();
-  refreshMapStats();
+  if(!opts.quiet){ _scheduleMapRender('marker-update'); }
+  return mkrs[id];
 }
 function hideSource(id){
   if(mkrs[id]){mkrs[id].remove();delete mkrs[id];}
@@ -594,12 +891,7 @@ function mapFilter(btn){
 }
 function mapFilterLegend(el){
   el.classList.toggle('hidden');
-  const m=el.dataset.m, hide=el.classList.contains('hidden');
-  Object.entries(mkrs).forEach(([id,mk])=>{
-    if((srcs[id]?.pos_method||'')=== m){ if(hide) mk.remove(); else if(_markerVisible(srcs[id])) mk.addTo(map); }
-  });
-  _refreshRelationshipLines();
-  refreshMapStats();
+  _scheduleMapRender('legend-filter', true);
 }
 let _pathsVisible=true;
 
@@ -621,7 +913,7 @@ function _renderPathsList(){
       ?`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${p.color};flex-shrink:0"></span>`
       :`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid ${p.color};background:transparent;flex-shrink:0"></span>`;
     const nameStyle=`flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.7rem;${on?'color:var(--txt)':'color:var(--mu);text-decoration:line-through'}`;
-    const sub=p.overview?`${p.points||0} preview pts`:(p.gps?`${p.gps} GPS / ${p.obs||0} frame pts`:`${p.points||0} frame pts`); // displayed points are decimated for fat sessions
+    const sub=p.overview?`${p.points||0}${p.total&&p.total>p.points?`/${p.total}`:''} preview pts`:(p.gps?`${p.gps} GPS / ${p.obs||0} frame pts`:`${p.points||0} frame pts`); // displayed points are decimated for fat sessions
     return `<div style="display:flex;align-items:center;gap:.3rem;margin-bottom:.25rem;cursor:pointer" onclick="toggleOnePath(${i})" title="Click to show/hide">
       ${dot}
       <span style="${nameStyle}" title="${p.name}">${p.name}</span>
@@ -649,16 +941,49 @@ function toggleAllPaths(){
   _updatePathsToggleBtn();
   _renderPathsList();
 }
+
+function _enoughRouteGeometry(rows){
+  rows=(rows||[]).filter(r=>r&&r.lat!=null&&r.lon!=null);
+  if(rows.length<2) return false;
+  let minLat=Infinity,maxLat=-Infinity,minLon=Infinity,maxLon=-Infinity, seen=new Set();
+  rows.forEach(r=>{
+    const la=+r.lat, lo=+r.lon;
+    if(!Number.isFinite(la)||!Number.isFinite(lo)) return;
+    minLat=Math.min(minLat,la); maxLat=Math.max(maxLat,la);
+    minLon=Math.min(minLon,lo); maxLon=Math.max(maxLon,lo);
+    seen.add(la.toFixed(6)+','+lo.toFixed(6));
+  });
+  if(seen.size<2) return false;
+  const midLat=(minLat+maxLat)/2;
+  const dLat=(maxLat-minLat)*111320;
+  const dLon=(maxLon-minLon)*111320*Math.cos(midLat*Math.PI/180);
+  return Math.sqrt(dLat*dLat+dLon*dLon)>2;
+}
+
+function _fitPathLayer(p){
+  if(!p||!p.layer||!p.layer.getBounds||!map) return;
+  try{const b=p.layer.getBounds(); if(b&&b.isValid&&b.isValid()) map.fitBounds(b.pad(0.08));}catch(e){}
+}
+
 function addPathFromSession(path, name, opts){
   opts=opts||{};
   const overview=!!opts.overview;
   const existingIdx=_loadedPaths.findIndex(p=>p.path===path);
   if(existingIdx>=0){
-    // Manual Map Path upgrades a cheap bulk overview to the full decimated RF-dot view.
-    if(!overview&&_loadedPaths[existingIdx].overview){removeLoadedPath(existingIdx);}
-    else return Promise.resolve({skipped:true,path});
+    const ex=_loadedPaths[existingIdx];
+    // Manual Map Path / Solve should not silently reuse a stale or hidden path.
+    // Bulk previews may be upgraded to the full decimated RF-dot view, and an
+    // explicit user action should make the path visible even if the global
+    // Paths toggle was previously off.
+    if(opts.force || (!overview&&ex.overview)){removeLoadedPath(existingIdx);}
+    else{
+      if(opts.show && ex.visible===false){_pathsVisible=true; _setPathVisible(ex,true); _updatePathsToggleBtn(); _renderPathsList();}
+      if(opts.fit) _fitPathLayer(ex);
+      return Promise.resolve({skipped:true,path});
+    }
   }
   initMap();
+  if(opts.show){_pathsVisible=true; _updatePathsToggleBtn();}
   const url=overview
     ?('/api/session/records?map=1&overview=1&max_points='+(opts.maxPoints||900)+'&path='+encodeURIComponent(path))
     :('/api/session/records?map=1&max_gps=2500&max_obs=6000&path='+encodeURIComponent(path));
@@ -676,16 +1001,25 @@ function addPathFromSession(path, name, opts){
       if(!georecs.length) return {empty:true,path};
       const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps'||r.record_type==='route');
       const obsrecs=overview?[]:georecs.filter(r=>!(r.record_type==='gps'||r.source==='gps'||r.record_type==='route'));
-      const routrecs=gpsrecs.length?gpsrecs:obsrecs;
-      const color=_PATH_COLORS[_loadedPaths.length%_PATH_COLORS.length];
-      const on=_pathsVisible;
+      // Prefer true GPS breadcrumbs only when they actually form a route.
+      // Some sessions contain one/few GPS breadcrumbs plus many geotagged RF
+      // observations; using the sparse GPS set alone makes the path appear
+      // missing even though solved sources sit on valid observation geometry.
+      const routrecs=_enoughRouteGeometry(gpsrecs)?gpsrecs:(_enoughRouteGeometry(obsrecs)?obsrecs:gpsrecs.concat(obsrecs));
+      const sampledTotal=Math.max(...georecs.map(r=>Number(r.sampled_total||0)), georecs.length);
+      const color=_stablePathColor(path);
+      const on=opts.show?true:_pathsVisible;
       const layer=L.polyline(routrecs.map(r=>[r.lat,r.lon]),
         {color,opacity:overview?.42:.55,weight:overview?2.4:2,dashArray:gpsrecs.length?'':'6 4'});
       if(on) layer.addTo(map);
       // GPS breadcrumbs draw the route. Observation dots are drawn only for
       // manual Map Path. Bulk solve gets cheap route previews so a Pi does not
       // create tens of thousands of Leaflet markers.
-      const dotrecs=overview?gpsrecs:gpsrecs.concat(obsrecs);
+      const rawDotrecs=overview?gpsrecs:gpsrecs.concat(obsrecs);
+      // Route polylines are cheap; thousands of clickable path-dot markers are
+      // not.  Keep overview/DB paths as line-only unless the hidden debug flag
+      // _pathDotsEnabled is set.  Manual paths still cap materialized dots.
+      const dotrecs=(!overview||_pathDotsEnabled)?rawDotrecs.slice(0, overview?400:1800):[];
       const dots=dotrecs.map(r=>{
         const isGps=(r.record_type==='gps'||r.source==='gps'||r.record_type==='route');
         const stale=r.gps_held||r.gps_hold_s!=null;
@@ -698,7 +1032,7 @@ function addPathFromSession(path, name, opts){
           ?`<b>Bulk route preview</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
           :isGps
             ?`<b>GPS breadcrumb</b><br>${coords}<br><span style="color:var(--mu)">${ts}</span>`
-            :`${_displaySSID(r.ssid)?`<b>${_xmlEsc(_displaySSID(r.ssid))}</b><br>`:''}${r.id?`<small style="color:var(--mu)">${r.id}</small><br>`:''}`
+            :`${_displaySSID(r.ssid)?`<b>${_xmlEsc(_displaySSID(r.ssid))}</b><br>`:''}${(r.source_id||r.identifier||r.id)?`<small style="color:var(--mu)">${r.source_id||r.identifier||r.id}</small><br>`:''}`
               +`<span style="color:var(--ylw)">RSSI:</span> ${r.rssi??'?'} dBm &nbsp;<span style="color:var(--mu)">Freq:</span> ${freq}`
               +`${r.protocol?` <span style="color:var(--mu)">(${r.protocol})</span>`:''}`
               +`${held}<br>${coords}<br><span style="color:var(--mu)">${ts}</span>`;
@@ -707,14 +1041,59 @@ function addPathFromSession(path, name, opts){
         return dot;
       });
       const firstPath=_loadedPaths.length===0;
-      _loadedPaths.push({name,path,color,layer,dots,visible:on,gps:gpsrecs.length,obs:obsrecs.length,points:dotrecs.length,overview});
-      if(firstPath&&layer.getBounds&&layer.getBounds().isValid&&layer.getBounds().isValid()){
-        try{map.fitBounds(layer.getBounds().pad(0.08));}catch(e){}
-      }
+      const loaded={name,path,color,layer,dots,visible:on,gps:gpsrecs.length,obs:obsrecs.length,points:rawDotrecs.length,total:sampledTotal,overview};
+      _loadedPaths.push(loaded);
+      if((opts.fit||firstPath)&&on) _fitPathLayer(loaded);
       _renderPathsList();
       refreshMapStats();
-    });
+      if(_selectedSourceId) _drawSourceSampleLines(_selectedSourceId);
+      sysLog((overview?'Loaded route preview: ':'Loaded map path: ')+(name||path.split('/').pop())+` (${rawDotrecs.length}/${sampledTotal} pts, ${dots.length} dot markers)`);
+      return {ok:true,path,points:rawDotrecs.length,total:sampledTotal,gps:gpsrecs.length,obs:obsrecs.length,overview};
+    }).catch(err=>{sysLog('Map path load failed: '+(name||path.split('/').pop())+' — '+err); return {error:String(err),path};});
 }
+
+function addPathFromSolverDb(db, sessionPath, name, opts){
+  opts=opts||{}; initMap();
+  const pathKey='solverdb:'+db+'#'+sessionPath;
+  const existingIdx=_loadedPaths.findIndex(p=>p.path===pathKey);
+  if(existingIdx>=0){
+    const ex=_loadedPaths[existingIdx];
+    if(opts.show&&ex.visible===false){_pathsVisible=true;_setPathVisible(ex,true);_updatePathsToggleBtn();_renderPathsList();}
+    if(opts.fit) _fitPathLayer(ex);
+    return Promise.resolve({skipped:true,path:pathKey});
+  }
+  const url='/api/solver/path_records?db='+encodeURIComponent(db)+'&session_path='+encodeURIComponent(sessionPath);
+  return fetch(url).then(r=>r.json()).then(recs=>{
+    if(!Array.isArray(recs)||!recs.length) return {empty:true,path:pathKey};
+    const georecs=recs.filter(r=>r.lat!=null&&r.lon!=null);
+    if(!georecs.length) return {empty:true,path:pathKey};
+    const gpsrecs=georecs.filter(r=>r.record_type==='gps'||r.source==='gps'||r.record_type==='route');
+    const obsrecs=georecs.filter(r=>!(r.record_type==='gps'||r.source==='gps'||r.record_type==='route'));
+    const routrecs=_enoughRouteGeometry(gpsrecs)?gpsrecs:(_enoughRouteGeometry(obsrecs)?obsrecs:gpsrecs.concat(obsrecs));
+    const sampledTotal=Math.max(...georecs.map(r=>Number(r.sampled_total||0)), georecs.length);
+    const color=_stablePathColor(sessionPath);
+    const on=opts.show?true:_pathsVisible;
+    const layer=L.polyline(routrecs.map(r=>[r.lat,r.lon]),{color,opacity:.46,weight:2.4,dashArray:'2 5'});
+    if(on) layer.addTo(map);
+    const rawDotrecs=gpsrecs.length?gpsrecs:georecs;
+    const dotrecs=_pathDotsEnabled?rawDotrecs.slice(0,400):[];
+    const dots=dotrecs.map(r=>{
+      const dot=L.circleMarker([r.lat,r.lon],{radius:2.5,color,fillColor:color,fillOpacity:.48,weight:1});
+      const ts=r.t?new Date(r.t*1000).toISOString().slice(11,19):'?';
+      dot.bindPopup(`<b>Solver DB route preview</b><br><span style="font-family:monospace;font-size:.7rem;color:var(--mu)">${(+r.lat).toFixed(6)}, ${(+r.lon).toFixed(6)}</span><br><span style="color:var(--mu)">${ts}</span>`,{maxWidth:230,className:'aw-path-tip'});
+      if(on) dot.addTo(map);
+      return dot;
+    });
+    const loaded={name:name||sessionPath.split('/').pop(),path:pathKey,color,layer,dots,visible:on,gps:gpsrecs.length,obs:obsrecs.length,points:rawDotrecs.length,total:sampledTotal,overview:true,solver_db_path:db,session_path:sessionPath};
+    _loadedPaths.push(loaded);
+    if(opts.fit&&on) _fitPathLayer(loaded);
+    _renderPathsList(); refreshMapStats();
+    if(_selectedSourceId) _drawSourceSampleLines(_selectedSourceId);
+    sysLog('Loaded solver DB path: '+loaded.name+` (${rawDotrecs.length}/${sampledTotal} pts, ${dots.length} dot markers)`);
+    return {ok:true,path:pathKey,points:rawDotrecs.length,total:sampledTotal};
+  }).catch(err=>{sysLog('Solver DB path load failed: '+(name||sessionPath.split('/').pop())+' — '+err); return {error:String(err),path:pathKey};});
+}
+
 function _dropSamplePath(path){
   for(const bucket of [_sourceSamples,_sourceSamplesByAp]){
     Object.keys(bucket).forEach(k=>{bucket[k]=(bucket[k]||[]).filter(s=>s.path!==path&&!String(s.path||'').startsWith(path+'#')); if(!bucket[k].length) delete bucket[k];});
@@ -749,7 +1128,12 @@ function refreshMapStats(){
       vis++; const r=_srcRole(rec); if(r==='ap')ap++; else if(r==='client')cli++; else unk++;
     }
   });
-  if(srcEl) srcEl.textContent=`${vis} source${vis!==1?'s':''} in view (${ap} AP / ${cli} client / ${unk} other)`;
+  if(srcEl){
+    const c=_clusterMarkers.length;
+    srcEl.textContent=_mapIsClustered
+      ? `${c} cluster${c!==1?'s':''} in view (${Object.values(srcs).filter(_markerVisible).length} matching source records)`
+      : `${vis} source${vis!==1?'s':''} in view (${ap} AP / ${cli} client / ${unk} other)`;
+  }
   if(relEl){
     const n=Object.values(_relLines).filter(l=>map.hasLayer(l)).length;
     relEl.textContent=n+' AP↔client link'+(n!==1?'s':'')+' in view';
@@ -770,7 +1154,7 @@ function refreshMapCount(){refreshMapStats();}
 
 // ── Map export ────────────────────────────────────────────────────────────────
 function _visibleSrcs(){
-  return Object.values(srcs).filter(r=>r.lat&&r.lon&&mkrs[r.id]&&map&&map.hasLayer(mkrs[r.id])&&_markerVisible(r));
+  return Object.values(srcs).filter(r=>r.lat&&r.lon&&mkrs[_markerKey(r)]&&map&&map.hasLayer(mkrs[_markerKey(r)])&&_markerVisible(r));
 }
 function _dlBlob(data,name,type){
   const a=document.createElement('a');
@@ -802,7 +1186,7 @@ function exportMapWigle(){
     const freq=Math.round((r.freq_mhz||0)*1000); // kHz
     const rssi=r.rssi!=null?r.rssi:-65;
     const acc=r.residual_m!=null?(+r.residual_m).toFixed(1):0;
-    return [r.id||'',_csvEsc(_cleanSSID(r.ssid)||''),_csvEsc(r.auth_mode||r.security||''),ts,ch,freq,rssi,
+    return [_sourceDisplayId(r),_csvEsc(_cleanSSID(r.ssid)||''),_csvEsc(r.auth_mode||r.security||''),ts,ch,freq,rssi,
             (+r.lat).toFixed(7),(+r.lon).toFixed(7),0,acc,'WIFI'].join(',');
   }).join('\n');
   _dlBlob(hdr+csv,'aetherward-wigle.csv','text/csv');
@@ -815,7 +1199,7 @@ function exportMapGeoJSON(){
   const features=rows.map(r=>({
     type:'Feature',
     geometry:{type:'Point',coordinates:[(+r.lon),(+r.lat),0]},
-    properties:{id:r.id||'',ssid:_cleanSSID(r.ssid)||'',auth_mode:r.auth_mode||'',security:r.security||'',
+    properties:{id:_sourceDisplayId(r),session:r.session_name||'',ssid:_cleanSSID(r.ssid)||'',auth_mode:r.auth_mode||'',security:r.security||'',
                 bssid:r.bssid||'',channel:r.channel??null,pos_method:r.pos_method||'',
                 rssi:r.rssi??null,freq_mhz:r.freq_mhz??null,samples:r.samples??null,
                 residual_m:r.residual_m??null},
@@ -835,7 +1219,7 @@ function exportMapKML(){
   const rows=_visibleSrcs();
   if(!rows.length){alert('No visible sources to export.');return;}
   const placemarks=rows.map(r=>
-    `<Placemark><name>${_xmlEsc(r.id||'')}</name>`+
+    `<Placemark><name>${_xmlEsc(_sourceDisplayId(r))}</name>`+
     `<description>SSID: ${_xmlEsc(_cleanSSID(r.ssid)||'<empty SSID>')}  Auth: ${_xmlEsc(r.auth_mode||r.security||'')}  RSSI: ${r.rssi??'?'} dBm  `+
     `Samples: ${r.samples??'?'}  Method: ${r.pos_method||'?'}</description>`+
     `<Point><coordinates>${(+r.lon).toFixed(7)},${(+r.lat).toFixed(7)},0</coordinates></Point></Placemark>`
@@ -845,13 +1229,85 @@ function exportMapKML(){
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
+
+function _samePositionRecord(a,b){
+  if(!a||!b) return false;
+  return String(a.id||'')===String(b.id||'') &&
+    Number(a.lat)===Number(b.lat) && Number(a.lon)===Number(b.lon) &&
+    String(a.pos_method||'')===String(b.pos_method||'') &&
+    Number(a.samples||0)===Number(b.samples||0) &&
+    String(a.session_name||'')===String(b.session_name||'');
+}
+function syncPositionsFromServer(reason){
+  _flushPositionRecords('pre-sync');
+  return fetch('/api/positions/all')
+    .then(r=>r.json()).then(rows=>{
+      if(!Array.isArray(rows)) return {error:'bad positions snapshot'};
+      let added=0, changed=0, removed=0;
+      const incoming=new Set();
+      rows.forEach(rec=>{
+        if(!rec||!rec.id) return;
+        incoming.add(String(rec.id));
+        const prev=srcs[rec.id];
+        srcs[rec.id]=rec;
+        if(!prev) added++;
+        else if(!_samePositionRecord(prev,rec)) changed++;
+      });
+      Object.keys(srcs).forEach(id=>{
+        if(!incoming.has(String(id))){
+          delete srcs[id]; removed++;
+          if(mkrs[id]){mkrs[id].remove();delete mkrs[id];}
+        }
+      });
+      _scheduleMapRender(reason||'position-sync', true);
+      updateHeader(); refreshMapStats();
+      if(document.getElementById('panel-positions').classList.contains('active')) renderPositions();
+      if(added||changed||removed) sysLog(`Synced positions${reason?` (${reason})`:''}: +${added}, updated ${changed}, removed ${removed}, real ${Object.values(srcs).filter(_isRealPositionRow).length}, stored ${Object.keys(srcs).length}`);
+      return {added,changed,removed,total:Object.keys(srcs).length,real:Object.values(srcs).filter(_isRealPositionRow).length};
+    }).catch(err=>{sysLog('Position snapshot sync failed: '+err); return {error:String(err)};});
+}
+
+function _flushPositionRecords(reason){
+  if(_positionFlushTimer){clearTimeout(_positionFlushTimer);_positionFlushTimer=null;}
+  const batch=_pendingPositionRecords.splice(0);
+  if(!batch.length) return;
+  let added=0, changed=0;
+  batch.forEach(rec=>{
+    if(!rec||!rec.id) return;
+    const prev=srcs[rec.id];
+    srcs[rec.id]=rec; totalUpd++;
+    if(!prev) added++; else if(!_samePositionRecord(prev,rec)) changed++;
+  });
+  _scheduleMapRender(reason||'position-batch');
+  updateHeader();
+  if(document.getElementById('panel-positions').classList.contains('active')) renderPositions();
+  if(batch.length>25 || reason) sysLog(`Applied ${batch.length} position update(s)${reason?` (${reason})`:''}: +${added}, changed ${changed}, real ${Object.values(srcs).filter(_isRealPositionRow).length}`);
+}
+function _queuePositionRecord(rec){
+  _pendingPositionRecords.push(rec);
+  // During heavy solves, do not make Leaflet/DOM process one SSE marker at a
+  // time.  Small micro-batches keep progress live and prevent the browser from
+  // looking stalled around a few hundred markers.
+  if(!_positionFlushTimer) _positionFlushTimer=setTimeout(()=>_flushPositionRecords('live-batch'),100);
+}
 function connectSSE(){
   const es=new EventSource('/api/events');
+  es.onopen=()=>{syncPositionsFromServer('sse-open');};
   es.onmessage=e=>{
     const rec=JSON.parse(e.data);
     if(rec.type==='position'){
-      srcs[rec.id]=rec; totalUpd++; updateMarker(rec); updateHeader(); appendLog(rec);
-      if(document.getElementById('panel-positions').classList.contains('active')) renderPositions();
+      _queuePositionRecord(rec);
+    } else if(rec.type==='positions_reset'){
+      _pendingPositionRecords.splice(0);
+      if(_positionFlushTimer){clearTimeout(_positionFlushTimer);_positionFlushTimer=null;}
+      Object.keys(srcs).forEach(k=>delete srcs[k]);
+      Object.values(mkrs).forEach(m=>{try{m.remove();}catch(e){}});
+      Object.keys(mkrs).forEach(k=>delete mkrs[k]);
+      _clearClusterMarkers(); _clearSampleLines();
+      (rec.kept||[]).forEach(r=>{if(r&&r.id){srcs[r.id]=r;}});
+      _scheduleMapRender('positions-reset', true);
+      updateHeader(); refreshMapStats(); renderPositions();
+      sysLog(`Position state reset (${rec.reason||'solver'}): removed ${rec.removed||0}, kept ${(rec.kept||[]).length}`);
     } else if(rec.type==='source_removed'){
       delete srcs[rec.id];
       if(mkrs[rec.id]){mkrs[rec.id].remove();delete mkrs[rec.id];}
@@ -861,10 +1317,15 @@ function connectSSE(){
       if(document.getElementById('panel-positions').classList.contains('active')) renderPositions();
     } else if(rec.type==='session_path_ready'){
       addPathFromSession(rec.path, rec.name||rec.path.split('/').pop(), {overview:!!rec.overview, maxPoints:900});
-      if(rec.overview) sysLog('Loaded route preview: '+(rec.name||rec.path.split('/').pop()));
+    } else if(rec.type==='solve_progress'){
+      if(rec.phase==='done'||rec.running===false)_flushPositionRecords('progress-final');
+      updateSolveProgress(rec);
     } else if(rec.type==='log'){
       if(rec.source==='solve') appendSolveLog(rec.text);
       else appendRunLog(rec.text);
+      if(rec.source==='solve' && /\[batch\] done|Solver done/.test(String(rec.text||''))){
+        setTimeout(()=>syncPositionsFromServer('solver-finished'),250);
+      }
     }
   };
   es.onerror=()=>setTimeout(connectSSE,3000);
@@ -872,19 +1333,19 @@ function connectSSE(){
 
 // ── Header / dashboard ────────────────────────────────────────────────────────
 function updateHeader(){
-  const all=Object.values(srcs);
-  document.getElementById('hdr-src').textContent=all.length+' sources';
+  const all=Object.values(srcs), real=all.filter(_isRealPositionRow);
+  document.getElementById('hdr-src').textContent=real.length+' positions';
   document.getElementById('hdr-upd').textContent=totalUpd+' updates';
-  document.getElementById('s-total').textContent=all.length;
-  document.getElementById('s-rss').textContent=all.filter(r=>r.pos_method==='rss_trilateration').length;
-  document.getElementById('s-cen').textContent=all.filter(r=>r.pos_method==='rssi_centroid').length;
+  document.getElementById('s-total').textContent=real.length;
+  document.getElementById('s-rss').textContent=real.filter(r=>r.pos_method==='rss_trilateration').length;
+  document.getElementById('s-cen').textContent=real.filter(r=>r.pos_method==='rssi_centroid').length;
   document.getElementById('s-upd').textContent=totalUpd;
 }
 function loadStatus(){
   fetch('/api/status').then(r=>r.json()).then(d=>{
     const tb=document.getElementById('sys-tb');
     if(tb) tb.innerHTML=Object.entries(d).map(([k,v])=>
-      `<tr><td style="color:var(--mu);width:160px">${k}</td><td>${v}</td></tr>`).join('');
+      `<tr><td style="color:var(--mu);width:160px">${_xmlEsc(k)}</td><td>${_fmtStatusValue(v)}</td></tr>`).join('');
     document.getElementById('dot').className='dot'+(d.solve_running||d.run_running?'':' off');
     document.getElementById('hdr-label').textContent=d.run_running?'capturing':d.solve_running?'solving':'idle';
     document.getElementById('btn-start').disabled=d.solve_running;
@@ -967,12 +1428,13 @@ function renderBannerCanvas(){
 function badgeCls(m){return m==='rss_trilateration'?'b-rss':m==='tdoa'?'b-tdoa':m==='rssi_centroid'?'b-cen':'b-man';}
 function renderPositions(){
   const tb=document.getElementById('src-tb'); if(!tb)return;
-  const rows=Object.values(srcs).sort((a,b)=>(b.samples||0)-(a.samples||0));
+  const rows=Object.values(srcs).filter(_isRealPositionRow).sort((a,b)=>(b.samples||0)-(a.samples||0));
   tb.innerHTML=rows.length===0
     ?'<tr><td colspan="8" style="color:var(--mu);text-align:center;padding:1.25rem">No sources yet — start the solver</td></tr>'
     :rows.map(r=>{
       const ss=_displaySSID(r.ssid);
-      const lbl=ss?`<b>${_xmlEsc(ss)}</b> <span style="color:var(--mu)">${r.id}</span>`:r.id;
+      const sid=_sourceDisplayId(r), sess=r.session_name?` <span style="color:var(--mu)">[${_xmlEsc((r.session_folder?r.session_folder+'/':'')+r.session_name)}]</span>`:'';
+      const lbl=ss?`<b>${_xmlEsc(ss)}</b> <span style="color:var(--mu)">${_xmlEsc(sid)}</span>${sess}`:_xmlEsc(sid)+sess;
       const res=r.residual_dBm!=null?r.residual_dBm+' dB':r.residual_m!=null?(+r.residual_m).toFixed(1)+' m':'—';
       return `<tr>
         <td>${lbl}</td>
@@ -982,7 +1444,7 @@ function renderPositions(){
         <td>${r.samples||'—'}</td><td>${res}</td><td>${r.freq_mhz||'—'}</td>
         <td style="white-space:nowrap">
           <button class="btn btn-edit" onclick="openSrcModal(${JSON.stringify(r).replace(/"/g,'&quot;')})">Edit</button>
-          <button class="btn btn-del"  onclick="delSrc('${r.id.replace(/'/g,"\\'")}')">Del</button>
+          <button class="btn btn-del"  onclick="delSrc('${_markerKey(r).replace(/'/g,"\\'")}')">Del</button>
         </td></tr>`;
     }).join('');
 }
@@ -1035,17 +1497,18 @@ function startSolve(){
       min_obs:parseInt(document.getElementById('sl-minobs').value),
       follow:!!document.getElementById('sl-follow')?.checked})})
     .then(()=>{
+      updateSolveProgress({running:true,phase:'start',pct:0,text:'Starting '+session.split('/').pop()});
       loadStatus();
       sysLog('Solver started: '+session.split('/').pop());
-      addPathFromSession(session, session.split('/').pop());
+      addPathFromSession(session, session.split('/').pop(), {force:true,show:true,fit:true});
     });
 }
-function stopSolve(){fetch('/api/solve/stop',{method:'POST'}).then(()=>{loadStatus();sysLog('Solver stopped.');});}
+function stopSolve(){fetch('/api/solve/stop',{method:'POST'}).then(()=>{updateSolveProgress({running:false,phase:'stopping',pct:0,text:'Stopping solver'});loadStatus();sysLog('Solver stopped.');});}
 
 function appendLog(rec){
   const el=document.getElementById('sl-log'); if(!el)return;
   const ts=new Date().toISOString().slice(11,19);
-  el.innerHTML+=`<div class="log-upd">${ts} [${rec.pos_method}] ${_displaySSID(rec.ssid)||rec.id||'?'} ${(+rec.lat).toFixed(5)}, ${(+rec.lon).toFixed(5)} s=${rec.samples??'?'}</div>`;
+  el.innerHTML+=`<div class="log-upd">${ts} [${rec.pos_method}] ${_displaySSID(rec.ssid)||_sourceDisplayId(rec)||'?'} ${(+rec.lat).toFixed(5)}, ${(+rec.lon).toFixed(5)} s=${rec.samples??'?'}</div>`;
   el.scrollTop=el.scrollHeight;
 }
 function sysLog(msg){
@@ -1057,6 +1520,21 @@ function appendSolveLog(text){
   const el=document.getElementById('sl-log'); if(!el)return;
   el.innerHTML+=`<div class="log-run">${new Date().toISOString().slice(11,19)} ${text}</div>`;
   el.scrollTop=el.scrollHeight;
+}
+
+function updateSolveProgress(p){
+  const wrap=document.getElementById('sl-progress-wrap');
+  const bar=document.getElementById('sl-progress-bar');
+  const pctEl=document.getElementById('sl-progress-pct');
+  const txt=document.getElementById('sl-progress-text');
+  if(!wrap||!bar||!pctEl||!txt)return;
+  const running=!!p.running;
+  const pct=Math.max(0,Math.min(100,Number(p.pct||0)));
+  wrap.style.display=(running||pct>0)?'block':'none';
+  bar.style.width=pct.toFixed(1)+'%';
+  pctEl.textContent=running?pct.toFixed(1)+'%':(p.phase==='done'?'done':'idle');
+  txt.textContent=p.text||p.phase||'idle';
+  if(!running&&p.phase==='done') setTimeout(()=>{try{wrap.style.display='none';}catch(e){}},8000);
 }
 
 // ── Run ───────────────────────────────────────────────────────────────────────
@@ -1075,7 +1553,53 @@ function appendRunLog(text){
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
+
+// ── Solver DBs ───────────────────────────────────────────────────────────────
+function loadSolverDbs(){
+  const sel=document.getElementById('solver-db-select'); if(!sel) return;
+  return fetch('/api/solver/dbs').then(r=>r.json()).then(dbs=>{
+    sel.innerHTML='<option value="">— select solved DB —</option>'+(dbs||[]).map(d=>`<option value="${_xmlEsc(d.path)}">${_xmlEsc(d.name)} · ${d.positions} pos · ${d.samples} samples · ${d.paths} paths</option>`).join('');
+    const note=document.getElementById('solver-db-note');
+    if(note) note.textContent=(dbs||[]).length?`${dbs.length} solved DB(s) in ~/.aetherward/solver`:'No solved DB yet. Start a solve to create one.';
+  }).catch(()=>{});
+}
+function loadSolverDbIntoMap(append){
+  const sel=document.getElementById('solver-db-select'); if(!sel||!sel.value){alert('Select a solved DB first.');return;}
+  const path=sel.value;
+  const note=document.getElementById('solver-db-note'); if(note) note.textContent='Loading solved DB…';
+  fetch('/api/solver/load',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,append:!!append})})
+    .then(r=>r.json()).then(d=>{
+      if(d.error){alert(d.error);return;}
+      syncPositionsFromServer('solver-db-load');
+      if(note) note.textContent=`Loaded ${d.loaded} position(s), ${d.samples} sample-cells, ${d.paths} path(s).`;
+      fetch('/api/solver/db_paths?path='+encodeURIComponent(path)).then(r=>r.json()).then(paths=>{
+        (paths||[]).forEach(p=>addPathFromSolverDb(path,p.session_path,p.session_name,{show:true}));
+      }).catch(()=>{});
+      sysLog(`Solver DB ${append?'appended':'loaded'}: ${d.loaded} positions`);
+    }).catch(err=>alert('Solver DB load failed: '+err));
+}
+function solverDbImportSelected(inp){
+  const files=[...(inp.files||[])]; if(!files.length) return;
+  const f=files[0]; const note=document.getElementById('solver-db-note');
+  if(note) note.textContent='Importing '+f.name+'…';
+  const rd=new FileReader();
+  rd.onload=()=>{
+    const bytes=new Uint8Array(rd.result); let bin='';
+    for(let i=0;i<bytes.length;i+=0x8000){bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+0x8000));}
+    const b64=btoa(bin);
+    fetch('/api/solver/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:f.name,b64})})
+      .then(r=>r.json()).then(d=>{
+        if(d.error){alert(d.error); if(note)note.textContent=d.error; return;}
+        if(note) note.textContent=`Imported ${f.name}: ${d.positions} positions, ${d.samples} sample-cells, ${d.paths} paths.`;
+        loadSolverDbs();
+      }).catch(err=>alert('Import failed: '+err));
+  };
+  rd.readAsArrayBuffer(f);
+  inp.value='';
+}
+
 let _bulkPathQueue=[], _bulkPathBusy=false;
+const _pathPreviewFailures={};
 function _sessionDisplayName(s){return (s.folder?`${s.folder}/`:'')+(s.name||String(s.path||'').split('/').pop());}
 function _queueBulkPathPreviews(sessions){
   const allowed=new Set(['wardriver','tdoa_raw','unknown']);
@@ -1097,12 +1621,31 @@ function _drainBulkPathQueue(){
   if(!item) return;
   _bulkPathBusy=true;
   addPathFromSession(item.path,item.name,{overview:true,maxPoints:900})
-    .finally(()=>{_bulkPathBusy=false;setTimeout(_drainBulkPathQueue,20);});
+    .then(res=>{
+      if(res&&res.error){
+        _pathPreviewFailures[item.path]=(_pathPreviewFailures[item.path]||0)+1;
+        if(_pathPreviewFailures[item.path]<3){
+          _bulkPathQueue.push(item);
+          sysLog('Retrying route preview: '+item.name+' ('+_pathPreviewFailures[item.path]+'/2)');
+        }
+      } else if(res&&res.ok){ delete _pathPreviewFailures[item.path]; }
+    })
+    .finally(()=>{_bulkPathBusy=false;setTimeout(_drainBulkPathQueue,40);});
+}
+function reconcileBulkPathPreviews(reason){
+  return fetch('/api/sessions').then(r=>r.json()).then(s=>{
+    const before=_loadedPaths.length;
+    _queueBulkPathPreviews(s||[]);
+    const missing=(s||[]).filter(x=>x&&x.path&&['wardriver','tdoa_raw','unknown'].includes(x.stype||'unknown')&&!_loadedPaths.some(p=>p.path===x.path)&&!_bulkPathQueue.some(q=>q.path===x.path));
+    if(missing.length) sysLog(`Path preview reconcile${reason?` (${reason})`:''}: ${missing.length} still missing/failed; use Sessions → Map Path on one file to force full load.`);
+    return {queued:_bulkPathQueue.length,loaded:_loadedPaths.length,before};
+  }).catch(e=>{sysLog('Path preview reconcile failed: '+e);});
 }
 function solveAllSessions(){
   const btn=document.getElementById('sess-solve-all-btn');
   btn.disabled=true; btn.textContent='Solving…';
-  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_cells:256,
+  const includeEvidence=!!document.getElementById('sess-include-evidence')?.checked;
+  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_cells:256,include_unsolved:includeEvidence,
       n_exp:parseFloat(document.getElementById('sl-nexp')?.value||'2.5'),
       min_obs:parseInt(document.getElementById('sl-minobs')?.value||'3')})})
     .then(r=>r.json()).then(d=>{
@@ -1113,9 +1656,15 @@ function solveAllSessions(){
       note.textContent='✓ bulk solve started (route previews will auto-load)';
       btn.after(note); setTimeout(()=>note.remove(),5000);
       loadStatus();
-      sysLog('Bulk solve started. Loading lightweight route previews for every session; use Sessions → Map Path to upgrade one file with RF dots.');
+      updateSolveProgress({running:true,phase:'batch-start',pct:0,text:'Starting bulk solve'});
+      sysLog(includeEvidence?'Bulk solve started. Real RSS/RSSI positions go to Positions; optional underconstrained evidence-centroids are map-only and excluded from Positions.':'Bulk solve started. Positions tab will contain real RSS/RSSI solved rows only; underconstrained evidence is excluded unless the evidence layer checkbox is enabled.');
+      // Huge batches can emit thousands of positions faster than a browser/SSE
+      // client can paint markers. Reconcile from the authoritative server-side
+      // position table so the UI count becomes deterministic.
+      [1500,5000,12000,30000].forEach(ms=>setTimeout(()=>syncPositionsFromServer('bulk-reconcile'),ms));
       if(Array.isArray(d.sessions)) _queueBulkPathPreviews(d.sessions);
       else fetch('/api/sessions').then(r=>r.json()).then(_queueBulkPathPreviews).catch(()=>{});
+      [8000,25000].forEach(ms=>setTimeout(()=>reconcileBulkPathPreviews('bulk'),ms));
     }).catch(err=>{btn.disabled=false;btn.textContent='Solve All';alert('Failed: '+err);});
 }
 function fmtSz(b){return b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';}
@@ -1241,7 +1790,7 @@ function quickMapPath(path,name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-map').classList.add('active');
   initMap(); if(map) map.invalidateSize();
-  addPathFromSession(path,name||path.split('/').pop());
+  addPathFromSession(path,name||path.split('/').pop(),{force:true,show:true,fit:true});
 }
 
 function quickSolve(path){
@@ -2125,6 +2674,7 @@ loadStatus();
 loadBanner();
 renderBannerCanvas();
 loadDetect();
+loadSolverDbs();
 setInterval(loadStatus,5000);
 </script>
 </body>
