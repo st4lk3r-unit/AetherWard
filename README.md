@@ -261,6 +261,54 @@ Follow a growing file while a run is still active:
 ./bin/aetherward solve ~/.aetherward/sessions/YOUR-SESSION.jsonl --follow --interval 2
 ```
 
+## Web UI solving and solved DB workflow
+
+The web UI has two different solve concepts:
+
+- **Session solve**: solve the currently selected session files and draw the result on the map.
+- **Solved DB**: a persistent SQLite database in `~/.aetherward/solver/` containing canonical positions, per-session evidence cells, route previews, and a manifest of imported sessions.
+
+In the **Sessions** panel:
+
+1. Tick the sessions you want to process, or leave all unchecked to use every solvable session.
+2. Use **Select all** / **Clear** when working with many sessions.
+3. Click **Solve Selected** to build a new bulk solved DB and display its positions.
+4. Keep **evidence layer** off for normal work. Turn it on only when debugging underconstrained sources; it draws weak observation centroids that are map-only and not trusted solved positions.
+
+In the **Solved DB** box:
+
+| Button | Meaning | Mutates DB? |
+|--------|---------|-------------|
+| **Load Map** | Replace current map positions with the selected solved DB | No |
+| **Overlay** | Draw the selected solved DB over the current map for visual comparison | No |
+| **Update DB** | Ingest selected/new/changed session files into the selected DB and recompute touched sources | Yes |
+| **Import DB** | Copy an external `.sqlite`, `.db`, or `.awdb` solved DB into the solver folder | Yes, by importing a copy |
+
+A typical incremental workflow is:
+
+```text
+1. Capture sessions 1-5
+2. Select those sessions → Solve Selected
+3. Use the created bulk DB as the reference DB
+4. Capture session 6
+5. Select only session 6, or leave selection empty to let Update DB find new/changed sessions
+6. Select the reference DB → Update DB
+```
+
+`Update DB` does not redo the whole world when it does not need to. It records each session's size, mtime, and hash in the DB manifest, skips unchanged sessions, removes stale contributions for changed sessions, and recomputes only source IDs touched by the ingested sessions.
+
+### Same-MAC merge guard
+
+AetherWard does **not** blindly assume that every observation with the same BSSID/MAC is the same physical source. Same-MAC observations are first grouped into small geo-cells, then checked for geographic consistency:
+
+- one strong cluster plus a tiny far cluster → solve the strong cluster and quarantine the far evidence as suspicious;
+- multiple strong distant clusters → split the source into `MAC#geo1`, `MAC#geo2`, ...;
+- close/compatible clusters → merge into one canonical position.
+
+This prevents one bad GPS sample, parser mistake, spoofed/reused MAC, or distant duplicate from dragging the solved AP away from the real area. Solved positions are still approximate RSS/RSSI estimates, not proof of exact AP placement.
+
+See [`docs/web-solve.md`](docs/web-solve.md) for the full UI workflow and caveats.
+
 ## CLI reference
 
 ```bash
@@ -274,7 +322,7 @@ If you installed into the repo virtualenv and do not want to activate it, replac
 |---------|---------|
 | `aetherward` | Interactive terminal menu |
 | `aetherward wizard` | Terminal config wizard |
-| `aetherward web --open` | Browser UI: wizard, editor, runner, live map, sessions |
+| `aetherward web --open` | Browser UI: wizard, editor, runner, live map, sessions, selected bulk solve, solved DB workflow |
 | `aetherward run [CONFIG]` | Start a capture session |
 | `aetherward run CONFIG --log` | Run and tee stdout/stderr to `~/.aetherward/logs/` |
 | `aetherward run CONFIG --log-file FILE` | Run with a custom log path |
@@ -368,6 +416,7 @@ Full reference: [`docs/config.md`](docs/config.md).
 | `~/.aetherward/configs/` | Saved TOML/JSON/YAML configs |
 | `~/.aetherward/sessions/` | Recorded JSONL sessions |
 | `~/.aetherward/logs/` | Optional run logs created by `--log` or the web UI log checkbox |
+| `~/.aetherward/solver/` | Solved SQLite DBs, session manifests, route previews, canonical positions, and per-session evidence cells |
 | `~/.aetherward/.last_config` | Last selected config |
 
 ## Session files
@@ -402,8 +451,12 @@ The web UI provides:
 - run button for saved configs
 - run-log checkbox
 - live status/log pane
-- session browser
+- session browser with per-session checkboxes
 - raw path and source map
+- selected-session bulk solving
+- solved DB load/overlay/update/import controls
+- optional weak evidence layer for debugging underconstrained sources
+- stable fixed path color palette for route/sample-link distinction
 - ENU/array geometry viewer
 
 The server is a Python stdlib HTTP server with Server-Sent Events. There is no npm build step.
@@ -488,6 +541,20 @@ backend_config = {interface = "wlan1", auto_recover = true, recover_cooldown = 2
 
 Check the run log for `set channel` failures and interface recovery attempts.
 
+### A solved AP looks pulled far away
+
+First compare against the raw sanity HTML:
+
+```bash
+./bin/aetherward session-check ~/.aetherward/sessions/YOUR-SESSION.jsonl --details --html
+```
+
+If the raw samples contain one distant point for the same MAC, the web bulk solver should quarantine it or split it into a `#geoN` source instead of averaging it into the main AP. If the wrong point still poisons the result, keep the session and DB: that is a solver bug worth reporting with the source ID, sessions used, and the distance between clusters.
+
+### Update DB did not change anything
+
+`Update DB` skips sessions already present in the selected DB when size, mtime, and hash match. Select the specific new/changed sessions in the Sessions panel, or rebuild with **Solve Selected** when you changed solver settings and want a clean DB.
+
 ## Development and tests
 
 Developer install:
@@ -542,5 +609,6 @@ The optional C core accelerates TDOA/DSP paths. Wardriver mode works without it.
 | [`docs/config.md`](docs/config.md) | Complete config key reference |
 | [`docs/backends.md`](docs/backends.md) | Hardware, GPS, IMU backend notes |
 | [`docs/modes.md`](docs/modes.md) | Wardriver, TDOA, and array-sensing internals |
+| [`docs/web-solve.md`](docs/web-solve.md) | Web UI session selection, solved DB workflow, evidence layer, geo-guarded source splitting |
 | [`docs/session-format.md`](docs/session-format.md) | JSONL fields, record types, jq recipes |
 | [`docs/plugin-api.md`](docs/plugin-api.md) | Writing custom hardware backends |
