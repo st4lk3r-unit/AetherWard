@@ -32,7 +32,17 @@ Model: `RSSI_i = A − 10·n·log₁₀(d_i)`
 - `n` = path loss exponent (tuned with `--n-exp`)
 - `d_i` = distance from observer i to transmitter
 
-Solved jointly for transmitter position and A using Gauss-Newton least squares. Requires ≥3 observations with meaningful spread. Falls back to RSSI-weighted centroid when the system is too ill-conditioned.
+Solved jointly for transmitter position and A using Gauss-Newton least squares. Requires ≥3 observations with meaningful spread. The CLI solver can fall back to an RSSI-weighted centroid when the system is too ill-conditioned.
+
+The web bulk solver adds extra guard rails for multi-session wardriving:
+
+- repeated observations are aggregated into small geo-cells so repeated/stale GPS samples do not dominate;
+- same-MAC/BSSID observations are checked for geographic consistency before merging;
+- tiny distant clusters are quarantined as suspicious evidence;
+- multiple strong distant clusters are split into `MAC#geo1`, `MAC#geo2`, ... rather than averaged into a lie;
+- optional weak evidence centroids are debug/map-only and are not trusted solved positions.
+
+RSS positions are approximate triage estimates. They should not be treated as proof of an exact physical AP location.
 
 **Choosing `n_exp`:**
 
