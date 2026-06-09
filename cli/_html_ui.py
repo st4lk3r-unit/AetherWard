@@ -494,13 +494,14 @@ On: keep watching a growing capture file until Stop is pressed.">?</span>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:.6rem;flex-wrap:wrap">
         <div>
           <b style="color:var(--txt);font-size:.82rem">Solved DB</b>
-          <div style="font-size:.71rem;color:var(--mu);margin-top:.12rem">Precomputed positions, solver sample-cells, and route previews in <code>~/.aetherward/solver</code>. Loading a DB avoids rescanning huge JSONL files for map/sample lookup.</div>
+          <div style="font-size:.71rem;color:var(--mu);margin-top:.12rem">Precomputed canonical positions, per-session sample-cells, route previews, and a session manifest in <code>~/.aetherward/solver</code>. Use <b>Update DB</b> to ingest only new/changed sessions into the selected DB.</div>
         </div>
         <div style="display:flex;gap:.35rem;align-items:center;flex-wrap:wrap">
           <select id="solver-db-select" style="min-width:270px"><option value="">— select solved DB —</option></select>
           <button class="btn btn-s" onclick="loadSolverDbs()">Refresh</button>
-          <button class="btn btn-s" onclick="loadSolverDbIntoMap(false)" title="Replace current solved positions with this DB">Load</button>
-          <button class="btn btn-s" onclick="loadSolverDbIntoMap(true)" title="Append this DB onto the current map">Append</button>
+          <button class="btn btn-s" onclick="loadSolverDbIntoMap(false)" title="Replace current solved positions with this DB">Load Map</button>
+          <button class="btn btn-s" onclick="loadSolverDbIntoMap(true)" title="Read-only visual overlay; does not modify the DB">Overlay</button>
+          <button class="btn btn-p" id="solver-db-update-btn" onclick="updateSolverDbWithSessions()" title="Append new/changed session files into the selected DB and recompute touched sources only">Update DB</button>
           <button class="btn btn-s" onclick="document.getElementById('solver-db-import-input').click()">Import DB</button>
           <input type="file" id="solver-db-import-input" accept=".sqlite,.db,.awdb" style="display:none" onchange="solverDbImportSelected(this)">
         </div>
@@ -520,16 +521,19 @@ On: keep watching a growing capture file until Stop is pressed.">?</span>
       <span class="page-hdr-title">Session files</span>
       <div class="page-hdr-actions">
         <button class="btn btn-s" onclick="loadSessions()">Refresh</button>
+        <button class="btn btn-s" onclick="selectAllSolvableSessions(true)">Select all</button>
+        <button class="btn btn-s" onclick="selectAllSolvableSessions(false)">Clear</button>
         <button class="btn btn-s" onclick="document.getElementById('sess-import-input').click()">↑ Import</button>
         <input type="file" id="sess-import-input" accept=".jsonl" multiple style="display:none" onchange="sessImportSelected(this)">
         <label title="Optional: draw underconstrained evidence centroids on the map. They are not counted in the Positions tab." style="font-size:.72rem;color:var(--mu);display:flex;align-items:center;gap:.25rem"><input type="checkbox" id="sess-include-evidence"> evidence layer</label>
-        <button class="btn btn-p" id="sess-solve-all-btn" onclick="solveAllSessions()">Solve All</button>
+        <button class="btn btn-p" id="sess-solve-all-btn" onclick="solveAllSessions()">Solve Selected</button>
       </div>
     </div>
     <div style="font-size:.77rem;color:var(--mu);padding:.3rem .2rem .1rem;font-family:monospace" id="sess-breadcrumb"></div>
+    <div style="font-size:.74rem;color:var(--mu);padding:.1rem .2rem .35rem;font-family:monospace" id="sess-selection-note">No selected sessions; Solve Selected will use all solvable sessions.</div>
     <div class="card" style="padding:0;overflow-x:auto">
       <table>
-        <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Records</th><th>Modified</th><th></th></tr></thead>
+        <thead><tr><th style="width:32px"><input type="checkbox" id="sess-select-all-visible" onchange="selectVisibleSessions(this.checked)"></th><th>Name</th><th>Type</th><th>Size</th><th>Records</th><th>Modified</th><th></th></tr></thead>
         <tbody id="sess-tb"></tbody>
       </table>
     </div>
