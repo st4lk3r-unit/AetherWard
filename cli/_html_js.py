@@ -88,15 +88,27 @@ function _fmtStatusValue(v){
 // ── Map filter state ──────────────────────────────────────────────────────────
 let _mapFilter='all';
 let _mapRoleFilter='all', _mapShowRelations=true, _selectedSourceId=null;
-const _PATH_COLORS=['#ff3c3c','#3c9eff','#3cff6e','#ffcc3c','#cc3cff','#ff3c8e','#ff8c3c','#3cffee','#8cff3c','#3c6eff','#ff6e3c','#e0ff3c'];
-function _pathHash(s){
-  s=String(s||''); let h=2166136261;
-  for(let i=0;i<s.length;i++){h^=s.charCodeAt(i); h=Math.imul(h,16777619);}
-  return h>>>0;
+const _PATH_COLORS=[
+  '#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#46f0f0','#f032e6','#bcf60c',
+  '#fabebe','#008080','#e6beff','#9a6324','#fffac8','#800000','#aaffc3','#808000',
+  '#ffd8b1','#000075','#808080','#ffe119','#a9a9ff','#ff7f7f','#7fffd4','#b8860b'
+];
+const _pathColorByKey=new Map();
+let _pathColorNext=0;
+function _basePathColorKey(key){
+  const parsed=_parseSolverPathKey(key);
+  return parsed&&parsed.session_path?parsed.session_path:String(key||'');
 }
-function _stablePathColor(key){
-  return _PATH_COLORS[_pathHash(String(key||'')) % _PATH_COLORS.length];
+function _pathColorFor(key){
+  const base=_basePathColorKey(key);
+  if(!base) return _PATH_COLORS[0];
+  if(!_pathColorByKey.has(base)){
+    _pathColorByKey.set(base,_PATH_COLORS[_pathColorNext % _PATH_COLORS.length]);
+    _pathColorNext++;
+  }
+  return _pathColorByKey.get(base);
 }
+function _stablePathColor(key){ return _pathColorFor(key); }
 function _parseSolverPathKey(path){
   const s=String(path||'');
   if(!s.startsWith('solverdb:')) return null;
@@ -447,7 +459,8 @@ function _indexSamplesFromRecords(path,recs,opts){
     const sample={
       path:colorPath, fetch_path:path,
       lat:+r.lat,lon:+r.lon,t:r.t||0,rssi:r.rssi??null,idx:i,
-      count:r.count||r.samples||1
+      count:r.count||r.samples||1,
+      geo_cluster_selected:r.geo_cluster_selected||''
     };
     const sid=_recordSourceId(r);
     _addSampleIndex(sid,sample);
@@ -502,6 +515,10 @@ function _samplesForSource(rec){
   let arr=[...(_sourceSamples[id]||[])];
   if(_srcRole(rec)==='ap'){
     for(const k of _candidateIds(rec)) arr=arr.concat(_sourceSamplesByAp[k]||[]);
+  }
+  if(rec.geo_clustered&&rec.id){
+    const pid=String(rec.id);
+    arr=arr.filter(s=>!s.geo_cluster_selected||String(s.geo_cluster_selected)===pid);
   }
   return _uniqSamples(arr);
 }
@@ -1558,9 +1575,27 @@ function appendRunLog(text){
 function loadSolverDbs(){
   const sel=document.getElementById('solver-db-select'); if(!sel) return;
   return fetch('/api/solver/dbs').then(r=>r.json()).then(dbs=>{
-    sel.innerHTML='<option value="">— select solved DB —</option>'+(dbs||[]).map(d=>`<option value="${_xmlEsc(d.path)}">${_xmlEsc(d.name)} · ${d.positions} pos · ${d.samples} samples · ${d.paths} paths</option>`).join('');
+    sel.innerHTML='<option value="">— select solved DB —</option>'+(dbs||[]).map(d=>`<option value="${_xmlEsc(d.path)}">${_xmlEsc(d.name)} · ${d.positions} pos · ${d.sessions||0} sessions · ${d.samples} samples · ${d.paths} paths</option>`).join('');
     const note=document.getElementById('solver-db-note');
     if(note) note.textContent=(dbs||[]).length?`${dbs.length} solved DB(s) in ~/.aetherward/solver`:'No solved DB yet. Start a solve to create one.';
+    sel.onchange=refreshSolverDbStatus;
+  }).catch(()=>{});
+}
+function _selectedSessionsQuery(){
+  const list=_selectedSessionList();
+  return list.map(p=>'&session='+encodeURIComponent(p)).join('');
+}
+function refreshSolverDbStatus(){
+  const sel=document.getElementById('solver-db-select');
+  const note=document.getElementById('solver-db-note');
+  if(!sel||!sel.value||!note) return Promise.resolve();
+  const selected=_selectedSessionList();
+  const q='?path='+encodeURIComponent(sel.value)+selected.map(p=>'&session='+encodeURIComponent(p)).join('');
+  return fetch('/api/solver/db_status'+q).then(r=>r.json()).then(d=>{
+    if(d.error){note.textContent=d.error;return;}
+    const scope=selected.length?`${selected.length} selected session(s)`:`all current solvable sessions`;
+    if(d.up_to_date) note.textContent=`Loaded DB: ${d.positions} pos / ${d.sessions||0} imported sessions. Up to date for ${scope}.`;
+    else note.textContent=`Loaded DB: ${d.positions} pos / ${d.sessions||0} imported sessions. Pending for ${scope}: ${d.pending_sessions} (${d.new_sessions} new, ${d.changed_sessions} changed).`;
   }).catch(()=>{});
 }
 function loadSolverDbIntoMap(append){
@@ -1571,13 +1606,49 @@ function loadSolverDbIntoMap(append){
     .then(r=>r.json()).then(d=>{
       if(d.error){alert(d.error);return;}
       syncPositionsFromServer('solver-db-load');
-      if(note) note.textContent=`Loaded ${d.loaded} position(s), ${d.samples} sample-cells, ${d.paths} path(s).`;
+      if(note) note.textContent=`${append?'Overlaid':'Loaded'} ${d.loaded} position(s), ${d.samples} sample-cells, ${d.sessions||0} session(s), ${d.paths} path(s).`;
       fetch('/api/solver/db_paths?path='+encodeURIComponent(path)).then(r=>r.json()).then(paths=>{
         (paths||[]).forEach(p=>addPathFromSolverDb(path,p.session_path,p.session_name,{show:true}));
       }).catch(()=>{});
-      sysLog(`Solver DB ${append?'appended':'loaded'}: ${d.loaded} positions`);
+      sysLog(`Solver DB ${append?'overlaid':'loaded'}: ${d.loaded} positions`);
+      refreshSolverDbStatus();
     }).catch(err=>alert('Solver DB load failed: '+err));
 }
+function updateSolverDbWithSessions(){
+  const sel=document.getElementById('solver-db-select'); if(!sel||!sel.value){alert('Select a solved DB first.');return;}
+  const btn=document.getElementById('solver-db-update-btn');
+  const path=sel.value;
+  const note=document.getElementById('solver-db-note');
+  const includeEvidence=!!document.getElementById('sess-include-evidence')?.checked;
+  const selected=_selectedSessionList();
+  const payload={path, max_cells:256, include_unsolved:includeEvidence, sessions:selected,
+    n_exp:parseFloat(document.getElementById('sl-nexp')?.value||'2.5'),
+    min_obs:parseInt(document.getElementById('sl-minobs')?.value||'3')};
+  if(btn){btn.disabled=true;btn.textContent='Updating…';}
+  if(note) note.textContent=selected.length?`Updating selected DB with ${selected.length} selected session(s)…`:'Updating selected DB with all new/changed sessions…';
+  fetch('/api/solver/update_sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(r=>r.json()).then(d=>{
+      if(btn){btn.disabled=false;btn.textContent='Update DB';}
+      if(d.error){alert(d.error); if(note)note.textContent=d.error; return;}
+      if(note) note.textContent=selected.length?`DB update started for ${selected.length} selected session(s). Unchanged selected sessions are skipped.`:'DB update started. New/changed sessions will be ingested; unchanged sessions are skipped.';
+      loadStatus();
+      updateSolveProgress({running:true,phase:'db-update-start',pct:0,text:'Updating solved DB'});
+      sysLog('Solver DB update started: ingesting new/changed sessions and recomputing touched sources only.');
+      [1500,5000,12000,30000].forEach(ms=>setTimeout(()=>{
+        loadSolverDbs();
+        syncPositionsFromServer('solver-db-update');
+        fetch('/api/solver/db_paths?path='+encodeURIComponent(path)).then(r=>r.json()).then(paths=>{
+          (paths||[]).forEach(p=>addPathFromSolverDb(path,p.session_path,p.session_name,{show:true}));
+        }).catch(()=>{});
+      },ms));
+      if(Array.isArray(d.sessions)) _queueBulkPathPreviews(d.sessions);
+    }).catch(err=>{
+      if(btn){btn.disabled=false;btn.textContent='Update DB';}
+      if(note) note.textContent='DB update failed.';
+      alert('DB update failed: '+err);
+    });
+}
+
 function solverDbImportSelected(inp){
   const files=[...(inp.files||[])]; if(!files.length) return;
   const f=files[0]; const note=document.getElementById('solver-db-note');
@@ -1643,21 +1714,22 @@ function reconcileBulkPathPreviews(reason){
 }
 function solveAllSessions(){
   const btn=document.getElementById('sess-solve-all-btn');
-  btn.disabled=true; btn.textContent='Solving…';
+  const selected=_selectedSessionList();
+  btn.disabled=true; btn.textContent=selected.length?'Solving selected…':'Solving all…';
   const includeEvidence=!!document.getElementById('sess-include-evidence')?.checked;
-  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_cells:256,include_unsolved:includeEvidence,
+  fetch('/api/solve/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_cells:256,include_unsolved:includeEvidence,sessions:selected,
       n_exp:parseFloat(document.getElementById('sl-nexp')?.value||'2.5'),
       min_obs:parseInt(document.getElementById('sl-minobs')?.value||'3')})})
     .then(r=>r.json()).then(d=>{
-      btn.disabled=false; btn.textContent='Solve All';
+      btn.disabled=false; _updateSessionSelectionNote();
       if(d.error){alert('Error: '+d.error);return;}
       const note=document.createElement('span');
       note.style='font-size:.74rem;color:var(--grn);margin-left:.5rem';
-      note.textContent='✓ bulk solve started (route previews will auto-load)';
+      note.textContent=selected.length?`✓ selected solve started (${selected.length} sessions)`:'✓ bulk solve started (all solvable sessions)';
       btn.after(note); setTimeout(()=>note.remove(),5000);
       loadStatus();
       updateSolveProgress({running:true,phase:'batch-start',pct:0,text:'Starting bulk solve'});
-      sysLog(includeEvidence?'Bulk solve started. Real RSS/RSSI positions go to Positions; optional underconstrained evidence-centroids are map-only and excluded from Positions.':'Bulk solve started. Positions tab will contain real RSS/RSSI solved rows only; underconstrained evidence is excluded unless the evidence layer checkbox is enabled.');
+      sysLog((selected.length?`Selected bulk solve started for ${selected.length} session(s). `:'Bulk solve started for all solvable sessions. ')+(includeEvidence?'Real RSS/RSSI positions go to Positions; optional underconstrained evidence-centroids are map-only and excluded from Positions.':'Positions tab will contain real RSS/RSSI solved rows only; underconstrained evidence is excluded unless the evidence layer checkbox is enabled.'));
       // Huge batches can emit thousands of positions faster than a browser/SSE
       // client can paint markers. Reconcile from the authoritative server-side
       // position table so the UI count becomes deterministic.
@@ -1665,11 +1737,40 @@ function solveAllSessions(){
       if(Array.isArray(d.sessions)) _queueBulkPathPreviews(d.sessions);
       else fetch('/api/sessions').then(r=>r.json()).then(_queueBulkPathPreviews).catch(()=>{});
       [8000,25000].forEach(ms=>setTimeout(()=>reconcileBulkPathPreviews('bulk'),ms));
-    }).catch(err=>{btn.disabled=false;btn.textContent='Solve All';alert('Failed: '+err);});
+    }).catch(err=>{btn.disabled=false;_updateSessionSelectionNote();alert('Failed: '+err);});
 }
 function fmtSz(b){return b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';}
 let _sessCwd='';
 let _sessAllData=[];
+const _selectedSessions=new Set();
+
+function _solvableSession(s){return !!s&&['wardriver','tdoa_raw','unknown'].includes(s.stype||'unknown');}
+function _selectedSessionList(){
+  const valid=new Set((_sessAllData||[]).filter(_solvableSession).map(s=>s.path));
+  return [..._selectedSessions].filter(p=>valid.has(p));
+}
+function _updateSessionSelectionNote(){
+  const n=_selectedSessionList().length;
+  const total=(_sessAllData||[]).filter(_solvableSession).length;
+  const note=document.getElementById('sess-selection-note');
+  if(note) note.textContent=n?`${n}/${total} solvable session(s) selected. Solve/Update DB will use only those.`:`No selected sessions; Solve Selected / Update DB will use all ${total} solvable session(s).`;
+  const btn=document.getElementById('sess-solve-all-btn');
+  if(btn) btn.textContent=n?`Solve ${n} Selected`:'Solve All';
+  refreshSolverDbStatus();
+}
+function selectAllSolvableSessions(on){
+  _selectedSessions.clear();
+  if(on) (_sessAllData||[]).filter(_solvableSession).forEach(s=>_selectedSessions.add(s.path));
+  _sessRender(); _updateSessionSelectionNote();
+}
+function selectVisibleSessions(on){
+  (_sessFilesHere(_sessAllData,_sessCwd)||[]).filter(_solvableSession).forEach(s=>{if(on)_selectedSessions.add(s.path);else _selectedSessions.delete(s.path);});
+  _sessRender(); _updateSessionSelectionNote();
+}
+function toggleSessionSelected(path,on){
+  if(on)_selectedSessions.add(path); else _selectedSessions.delete(path);
+  _updateSessionSelectionNote();
+}
 
 function _sessSubfolders(data, cwd){
   const seen=new Set(), result=[];
@@ -1696,7 +1797,11 @@ function sessNavigate(folder){_sessCwd=folder;_sessRender();}
 function loadSessions(){
   fetch('/api/sessions').then(r=>r.json()).then(data=>{
     _sessAllData=data;
+    // Drop selections for files that no longer exist.
+    const valid=new Set((data||[]).map(s=>s.path));
+    [..._selectedSessions].forEach(p=>{if(!valid.has(p))_selectedSessions.delete(p);});
     _sessRender();
+    _updateSessionSelectionNote();
     // populate solve/path dropdowns with all sessions
     const solvable=data.filter(s=>s.stype==='wardriver'||s.stype==='tdoa_raw'||s.stype==='unknown');
     const enuOnly =data.filter(s=>s.stype==='enu'||s.stype==='sensing');
@@ -1761,18 +1866,22 @@ function _sessRender(){
   if(_sessCwd!==''){
     const parent=_sessCwd.includes('/')?_sessCwd.slice(0,_sessCwd.lastIndexOf('/')):'';
     rows.push(`<tr style="cursor:pointer" onclick="sessNavigate('${parent}')">
-      <td colspan="6" style="color:var(--acc);font-family:monospace;padding:.35rem .6rem">↑ ..</td></tr>`);
+      <td colspan="7" style="color:var(--acc);font-family:monospace;padding:.35rem .6rem">↑ ..</td></tr>`);
   }
   subfolders.forEach(sf=>{
     const full=_sessCwd?_sessCwd+'/'+sf:sf;
     const count=data.filter(s=>(s.folder||'')===(full)||(s.folder||'').startsWith(full+'/')).length;
     rows.push(`<tr style="cursor:pointer" onclick="sessNavigate('${full}')">
-      <td colspan="6" style="color:var(--acc);font-family:monospace;padding:.35rem .6rem">
+      <td colspan="7" style="color:var(--acc);font-family:monospace;padding:.35rem .6rem">
         📁 ${sf}/ <span style="color:var(--mu);font-size:.72rem">${count} file${count!==1?'s':''}</span>
       </td></tr>`);
   });
   files.forEach(s=>{
+    const can=_solvableSession(s);
+    const checked=_selectedSessions.has(s.path)?' checked':'';
+    const sp=s.path.replace(/'/g,"\\'");
     rows.push(`<tr>
+      <td style="text-align:center">${can?`<input type="checkbox" class="sess-select-box"${checked} onchange="toggleSessionSelected('${sp}',this.checked)">`:''}</td>
       <td style="font-family:monospace;font-size:.82rem">${s.name}</td>
       <td><span class="badge ${typeCls[s.stype]||'b-man'}">${typeLabel[s.stype]||'?'}</span></td>
       <td>${fmtSz(s.size)}</td><td>${s.records??'?'}</td>
@@ -1780,7 +1889,7 @@ function _sessRender(){
       <td style="white-space:nowrap">${sessActions(s)}</td></tr>`);
   });
   if(rows.length===0){
-    rows.push('<tr><td colspan="6" style="color:var(--mu);text-align:center;padding:1.25rem">No session files found</td></tr>');
+    rows.push('<tr><td colspan="7" style="color:var(--mu);text-align:center;padding:1.25rem">No session files found</td></tr>');
   }
   tb.innerHTML=rows.join('');
 }
@@ -2449,7 +2558,7 @@ function _enuDrawYZ(){ _enuDraw('enu-canvas-yz','y_enu','z_enu','N','Up'); }
 function _enuTable(){
   const tb=document.getElementById('enu-tb'); if(!tb) return;
   tb.innerHTML=_enuRecs.length===0
-    ?'<tr><td colspan="7" style="color:var(--mu);text-align:center;padding:1rem">Load a JSONL file with x_enu / y_enu / z_enu fields</td></tr>'
+    ?'<tr><td colspan="6" style="color:var(--mu);text-align:center;padding:1rem">Load a JSONL file with x_enu / y_enu / z_enu fields</td></tr>'
     :_enuRecs.map(r=>`<tr>
         <td style="font-family:monospace;font-size:.78rem">${r.id||'—'}</td>
         <td>${(r.x_enu||0).toFixed(3)}</td><td>${(r.y_enu||0).toFixed(3)}</td>

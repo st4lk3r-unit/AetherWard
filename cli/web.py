@@ -198,6 +198,12 @@ _MAX_SOLVE_CELLS_PER_SOURCE = 256
 _MAP_MAX_GPS = 2500
 _MAP_MAX_OBS = 6000
 _MAP_BULK_PREVIEW_POINTS = 900
+# Same BSSID/MAC is only a candidate identity.  When sample cells for one
+# source form geographically separate components, split strong components and
+# quarantine tiny far components instead of averaging lies into one AP.
+_SOURCE_SPLIT_RADIUS_M = 700.0
+_SOURCE_SPLIT_MIN_CELLS = 3
+_SOURCE_SPLIT_MIN_RAW = 3
 
 
 def _as_float(value, default=None):
@@ -253,6 +259,49 @@ def _add_geo_observation(cells_by_sid: dict, sid: str, lat, lon, rssi,
         return True
     return False
 
+
+
+
+def _add_geo_cell_aggregate(cells_by_sid: dict, sid: str, cell: dict,
+                            max_cells: int = _MAX_SOLVE_CELLS_PER_SOURCE) -> bool:
+    """Merge an already-aggregated geo-cell into a bounded source aggregate."""
+    n = max(1, int(cell.get('count', 1)))
+    lat_f = _as_float(cell.get('lat_sum', 0.0) / n)
+    lon_f = _as_float(cell.get('lon_sum', 0.0) / n)
+    if lat_f is None or lon_f is None:
+        return False
+    rssi_f = _as_float(cell.get('rssi_sum', 0.0) / n, -100.0)
+    cells = cells_by_sid[sid]
+    key = _geo_cell_key(lat_f, lon_f)
+    if key in cells:
+        c = cells[key]
+        c['lat_sum'] += lat_f * n
+        c['lon_sum'] += lon_f * n
+        c['rssi_sum'] += rssi_f * n
+        c['count'] += n
+        return True
+    if len(cells) < max_cells:
+        cells[key] = {'lat_sum': lat_f * n, 'lon_sum': lon_f * n,
+                      'rssi_sum': rssi_f * n, 'count': n}
+        return True
+    weakest_key = None
+    weakest_rssi = 1e9
+    for k, c in cells.items():
+        avg = c['rssi_sum'] / max(1, c['count'])
+        if avg < weakest_rssi:
+            weakest_rssi = avg; weakest_key = k
+    if weakest_key is not None and rssi_f > weakest_rssi:
+        cells.pop(weakest_key, None)
+        cells[key] = {'lat_sum': lat_f * n, 'lon_sum': lon_f * n,
+                      'rssi_sum': rssi_f * n, 'count': n}
+        return True
+    return False
+
+
+def _merge_source_cells(dst_by_sid: dict, sid: str, src_cells: dict,
+                        max_cells: int = _MAX_SOLVE_CELLS_PER_SOURCE) -> None:
+    for cell in (src_cells or {}).values():
+        _add_geo_cell_aggregate(dst_by_sid, sid, cell, max_cells=max_cells)
 
 def _obs_from_cells(cells: dict) -> list[tuple[float, float, float]]:
     out = []
@@ -335,6 +384,150 @@ def _merge_source_meta(dst: dict, src: dict) -> dict:
     return _clean_relation_meta(dst)
 
 
+
+
+def _distance_m(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+    """Small-distance equirectangular distance in metres."""
+    lat_mid = math.radians((float(a_lat) + float(b_lat)) / 2.0)
+    dx = (float(b_lon) - float(a_lon)) * 111_320.0 * max(0.18, abs(math.cos(lat_mid)))
+    dy = (float(b_lat) - float(a_lat)) * 111_320.0
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _cell_point(cell: dict) -> tuple[float, float, float, int] | None:
+    try:
+        n = max(1, int(cell.get('count', 1)))
+        la = float(cell.get('lat_sum', 0.0)) / n
+        lo = float(cell.get('lon_sum', 0.0)) / n
+        rs = float(cell.get('rssi_sum', -100.0)) / n
+        if not (math.isfinite(la) and math.isfinite(lo)):
+            return None
+        return la, lo, rs, n
+    except Exception:
+        return None
+
+
+def _cluster_center_radius(cells: dict) -> tuple[float, float, float, int]:
+    sw = lat = lon = 0.0
+    raw = 0
+    pts = []
+    for c in (cells or {}).values():
+        pt = _cell_point(c)
+        if not pt:
+            continue
+        la, lo, rs, n = pt
+        w = max(1, n)
+        sw += w; lat += la * w; lon += lo * w; raw += n
+        pts.append((la, lo))
+    if sw <= 0 or not pts:
+        return 0.0, 0.0, 0.0, 0
+    lat /= sw; lon /= sw
+    radius = max([_distance_m(lat, lon, la, lo) for la, lo in pts] + [0.0])
+    return lat, lon, radius, raw
+
+
+def _split_source_geo_clusters(sid: str, cells: dict, *, min_obs: int,
+                               split_radius_m: float = _SOURCE_SPLIT_RADIUS_M) -> list[dict]:
+    """Return geo-consistent components for one claimed source ID.
+
+    A MAC/BSSID collision, parser bug, or bad held GPS point can otherwise merge
+    unrelated places and pull the solved point into a lie.  Strong separated
+    components become MAC#geoN.  Weak far components are quarantined as outliers
+    and recorded in metadata, not averaged into the solve.
+    """
+    items = []
+    for key, cell in (cells or {}).items():
+        pt = _cell_point(cell)
+        if not pt:
+            continue
+        la, lo, rs, n = pt
+        items.append({'key': key, 'cell': cell, 'lat': la, 'lon': lo, 'rssi': rs, 'count': n})
+    if not items:
+        return [{'id': str(sid), 'source_id': str(sid), 'cells': {},
+                 'meta': {'geo_clustered': False, 'geo_cluster_count': 0}}]
+    if len(items) <= 1:
+        return [{'id': str(sid), 'source_id': str(sid), 'cells': dict(cells or {}),
+                 'meta': {'geo_clustered': False, 'geo_cluster_count': 1}}]
+
+    # Connected components where each cell is close to at least one cell in the
+    # component.  O(n^2) is fine here because cells are already capped per source.
+    parent = list(range(len(items)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if _distance_m(items[i]['lat'], items[i]['lon'], items[j]['lat'], items[j]['lon']) <= split_radius_m:
+                union(i, j)
+
+    comps: dict[int, list] = {}
+    for i, it in enumerate(items):
+        comps.setdefault(find(i), []).append(it)
+    comp_list = []
+    for comp_items in comps.values():
+        comp_cells = {it['key']: it['cell'] for it in comp_items}
+        clat, clon, radius, raw = _cluster_center_radius(comp_cells)
+        best_rssi = max([it['rssi'] for it in comp_items] + [-999.0])
+        comp_list.append({'items': comp_items, 'cells': comp_cells,
+                          'cell_count': len(comp_cells), 'raw_count': raw,
+                          'lat': clat, 'lon': clon, 'radius_m': radius,
+                          'best_rssi': best_rssi})
+    comp_list.sort(key=lambda c: (c['raw_count'], c['cell_count'], c['best_rssi']), reverse=True)
+
+    if len(comp_list) <= 1:
+        return [{'id': str(sid), 'source_id': str(sid), 'cells': comp_list[0]['cells'],
+                 'meta': {'geo_clustered': False, 'geo_cluster_count': 1,
+                          'geo_cluster_radius_m': round(comp_list[0]['radius_m'], 2)}}]
+
+    def strong(c):
+        return c['cell_count'] >= max(2, int(min_obs or _SOURCE_SPLIT_MIN_CELLS)) or c['raw_count'] >= max(_SOURCE_SPLIT_MIN_RAW, int(min_obs or 3))
+
+    strong_comps = [c for c in comp_list if strong(c)]
+    if not strong_comps:
+        strong_comps = [comp_list[0]]
+    weak = [c for c in comp_list if c not in strong_comps]
+
+    total_raw = sum(c['raw_count'] for c in comp_list)
+    max_sep = 0.0
+    for i, a in enumerate(comp_list):
+        for b in comp_list[i+1:]:
+            max_sep = max(max_sep, _distance_m(a['lat'], a['lon'], b['lat'], b['lon']))
+
+    split = len(strong_comps) > 1
+    out = []
+    for idx, c in enumerate(strong_comps, 1):
+        position_id = f'{sid}#geo{idx}' if split else str(sid)
+        meta = {
+            'geo_clustered': True,
+            'geo_cluster_index': idx,
+            'geo_cluster_count': len(strong_comps),
+            'geo_component_count': len(comp_list),
+            'parent_source_id': str(sid),
+            'geo_cluster_center_lat': round(c['lat'], 7),
+            'geo_cluster_center_lon': round(c['lon'], 7),
+            'geo_cluster_radius_m': round(c['radius_m'], 2),
+            'geo_cluster_cells': int(c['cell_count']),
+            'geo_cluster_raw_samples': int(c['raw_count']),
+            'geo_split_radius_m': float(split_radius_m),
+            'geo_max_component_separation_m': round(max_sep, 2),
+            'geo_outlier_components': len(weak),
+            'geo_outlier_cells': int(sum(w['cell_count'] for w in weak)),
+            'geo_outlier_raw_samples': int(sum(w['raw_count'] for w in weak)),
+        }
+        if split:
+            meta['split_reason'] = 'geo_inconsistent_same_source_id'
+            meta['solve_warning'] = 'Same source ID formed multiple distant clusters; kept separate instead of merging by MAC only.'
+        elif weak:
+            meta['solve_warning'] = 'Tiny distant sample cluster quarantined; not used in canonical solve.'
+        if total_raw:
+            meta['geo_cluster_raw_fraction'] = round(c['raw_count'] / total_raw, 4)
+        out.append({'id': position_id, 'source_id': str(sid), 'cells': c['cells'], 'meta': meta})
+    return out
 
 def _cell_geometry_span_m(cells: dict) -> float:
     pts = []
@@ -708,15 +901,25 @@ def _source_sample_rows(path: Path, source: str, role: str = '', max_obs: int = 
     return matches
 
 
-def _batch_solve_sessions(max_sessions: int = 500) -> list[dict]:
-    return [s for s in _list_sessions()
-            if s['stype'] in ('wardriver', 'tdoa_raw', 'unknown')][:max_sessions]
+def _normalize_session_selection(session_paths: list | tuple | None) -> set[str]:
+    selected: set[str] = set()
+    root = AW_SESSIONS.resolve()
+    for raw in session_paths or []:
+        try:
+            p = Path(str(raw)).resolve()
+            if p.suffix == '.jsonl' and str(p).startswith(str(root)) and p.exists():
+                selected.add(str(p))
+        except Exception:
+            continue
+    return selected
 
 
-def _batch_marker_id(source_id: str, session_path: str) -> str:
-    """Namespace bulk-solved markers by session so same MACs do not overwrite."""
-    digest = hashlib.sha1(str(session_path).encode('utf-8', 'ignore')).hexdigest()[:10]
-    return f'{source_id}#{digest}'
+def _batch_solve_sessions(max_sessions: int = 500, session_paths: list | tuple | None = None) -> list[dict]:
+    selected = _normalize_session_selection(session_paths)
+    sessions = [s for s in _list_sessions() if s['stype'] in ('wardriver', 'tdoa_raw', 'unknown')]
+    if selected:
+        sessions = [s for s in sessions if str(Path(s['path']).resolve()) in selected]
+    return sessions[:max_sessions]
 
 
 
@@ -764,6 +967,17 @@ def _init_solver_db(con: sqlite3.Connection) -> None:
         raw_samples INTEGER,
         json TEXT NOT NULL
     )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        session_path TEXT PRIMARY KEY,
+        session_name TEXT,
+        size INTEGER,
+        mtime_ns INTEGER,
+        hash TEXT,
+        imported_at TEXT,
+        record_count INTEGER,
+        source_count INTEGER,
+        json TEXT NOT NULL DEFAULT '{}'
+    )""")
     con.execute("""CREATE TABLE IF NOT EXISTS source_samples(
         position_id TEXT,
         source_id TEXT,
@@ -774,8 +988,38 @@ def _init_solver_db(con: sqlite3.Connection) -> None:
         rssi REAL,
         count INTEGER,
         json TEXT NOT NULL,
-        PRIMARY KEY(position_id, seq)
+        PRIMARY KEY(position_id, session_path, seq)
     )""")
+    # Older bulk DBs used PRIMARY KEY(position_id, seq).  That silently
+    # overwrote per-session evidence when the same AP appeared in several
+    # sessions, which made a real incremental append impossible.  Upgrade the
+    # table in-place while preserving whatever evidence exists.
+    try:
+        info = con.execute('PRAGMA table_info(source_samples)').fetchall()
+        pk_cols = [r[1] for r in sorted([r for r in info if r[5]], key=lambda r: r[5])]
+        if pk_cols != ['position_id', 'session_path', 'seq']:
+            con.execute('ALTER TABLE source_samples RENAME TO source_samples_old')
+            con.execute("""CREATE TABLE source_samples(
+                position_id TEXT,
+                source_id TEXT,
+                session_path TEXT,
+                seq INTEGER,
+                lat REAL,
+                lon REAL,
+                rssi REAL,
+                count INTEGER,
+                json TEXT NOT NULL,
+                PRIMARY KEY(position_id, session_path, seq)
+            )""")
+            con.execute("""INSERT OR IGNORE INTO source_samples
+                (position_id,source_id,session_path,seq,lat,lon,rssi,count,json)
+                SELECT position_id,source_id,COALESCE(session_path,''),seq,lat,lon,rssi,count,json
+                FROM source_samples_old""")
+            con.execute('DROP TABLE source_samples_old')
+    except Exception:
+        # Do not make a legacy/partial DB unloadable; later writes will still
+        # fail loudly through the caller if the table is genuinely corrupt.
+        pass
     con.execute("""CREATE INDEX IF NOT EXISTS idx_solver_samples_position
         ON source_samples(position_id)""")
     con.execute("""CREATE INDEX IF NOT EXISTS idx_solver_samples_source_session
@@ -818,7 +1062,204 @@ def _db_counts(con: sqlite3.Connection) -> dict:
         'positions': one('SELECT COUNT(*) FROM positions'),
         'samples': one('SELECT COUNT(*) FROM source_samples'),
         'paths': one('SELECT COUNT(*) FROM path_previews'),
+        'sessions': one('SELECT COUNT(*) FROM sessions'),
     }
+
+
+def _session_file_fingerprint(path: Path) -> dict:
+    """Cheap but stable enough manifest fingerprint for incremental updates."""
+    st = path.stat()
+    h = hashlib.sha1()
+    h.update(str(path).encode('utf-8', 'ignore'))
+    h.update(str(st.st_size).encode())
+    h.update(str(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))).encode())
+    try:
+        with path.open('rb') as fh:
+            h.update(fh.read(65536))
+            if st.st_size > 65536:
+                fh.seek(max(0, st.st_size - 65536))
+                h.update(fh.read(65536))
+    except Exception:
+        pass
+    return {
+        'session_path': str(path),
+        'size': int(st.st_size),
+        'mtime_ns': int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))),
+        'hash': h.hexdigest(),
+    }
+
+
+def _session_db_status(con: sqlite3.Connection, session_path: str) -> tuple[str, dict]:
+    """Return ('new'|'changed'|'unchanged'|'missing', fingerprint)."""
+    p = Path(session_path)
+    if not p.exists():
+        return 'missing', {'session_path': str(p)}
+    fp = _session_file_fingerprint(p)
+    row = con.execute('SELECT size,mtime_ns,hash FROM sessions WHERE session_path=?', (str(p),)).fetchone()
+    if not row:
+        return 'new', fp
+    old_size, old_mtime_ns, old_hash = row
+    if int(old_size or -1) == fp['size'] and int(old_mtime_ns or -1) == fp['mtime_ns'] and str(old_hash or '') == fp['hash']:
+        return 'unchanged', fp
+    return 'changed', fp
+
+
+def _store_solver_session_manifest(con: sqlite3.Connection, sess: dict, *, record_count: int, source_count: int) -> None:
+    p = Path(sess['path'])
+    fp = _session_file_fingerprint(p)
+    name = (sess.get('folder') + '/' if sess.get('folder') else '') + (sess.get('name') or p.name)
+    payload = {**fp, 'record_count': int(record_count or 0), 'source_count': int(source_count or 0)}
+    con.execute("""INSERT OR REPLACE INTO sessions
+        (session_path,session_name,size,mtime_ns,hash,imported_at,record_count,source_count,json)
+        VALUES(?,?,?,?,?,?,?,?,?)""", (
+        str(p), name, fp['size'], fp['mtime_ns'], fp['hash'],
+        time.strftime('%Y-%m-%d %H:%M:%S'), int(record_count or 0), int(source_count or 0),
+        _json_dumps(payload)))
+
+
+def _index_session_for_solver(sess: dict, *, max_cells: int,
+                              progress_cb=None) -> tuple[dict, dict, int, int]:
+    """Index one JSONL session into per-source bounded RSS geo-cells."""
+    from collections import defaultdict
+    from aetherward.session import is_gps_record, record_source_id, source_meta_from_record
+
+    rss_cells: dict = defaultdict(dict)
+    rss_meta: dict = {}
+    rec_n = geo_n = 0
+    sess_size = max(1, int(sess.get('size') or Path(sess['path']).stat().st_size))
+    last_prog = 0.0
+    with open(sess['path'], encoding='utf-8', errors='replace') as fh:
+        while True:
+            if _solve_stop.is_set():
+                break
+            raw = fh.readline()
+            if not raw:
+                break
+            pos_now = fh.tell()
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            rec_n += 1
+            if is_gps_record(rec):
+                continue
+            sid = record_source_id(rec)
+            if rec.get('lat') is not None and rec.get('lon') is not None:
+                geo_n += 1
+                _add_geo_observation(
+                    rss_cells, sid, rec.get('lat'), rec.get('lon'),
+                    rec.get('rssi', -100.0), max_cells=max_cells)
+            rss_meta[sid] = _merge_source_meta(rss_meta.get(sid, {}), source_meta_from_record(rec))
+            rss_meta[sid].setdefault('ssid', '')
+            rss_meta[sid].setdefault('protocol', '')
+            if progress_cb:
+                now = time.time()
+                if now - last_prog > 0.8:
+                    progress_cb(rec_n, len(rss_cells), pos_now / sess_size)
+                    last_prog = now
+                    time.sleep(0)
+    return rss_cells, rss_meta, rec_n, geo_n
+
+
+def _store_solver_samples(con: sqlite3.Connection, position_id: str, source_id: str,
+                          session_path: str, cells: dict) -> None:
+    con.execute('DELETE FROM source_samples WHERE position_id=? AND session_path=?',
+                (position_id, session_path))
+    rows = _cells_to_sample_rows(position_id, source_id, session_path, cells)
+    if rows:
+        con.executemany("""INSERT OR REPLACE INTO source_samples
+            (position_id,source_id,session_path,seq,lat,lon,rssi,count,json)
+            VALUES(?,?,?,?,?,?,?,?,?)""", rows)
+
+
+def _delete_session_contribution(con: sqlite3.Connection, session_path: str) -> set[str]:
+    rows = con.execute('SELECT DISTINCT source_id FROM source_samples WHERE session_path=?',
+                       (session_path,)).fetchall()
+    affected = {str(r[0]) for r in rows if r and r[0]}
+    con.execute('DELETE FROM source_samples WHERE session_path=?', (session_path,))
+    con.execute('DELETE FROM path_previews WHERE session_path=?', (session_path,))
+    con.execute('DELETE FROM sessions WHERE session_path=?', (session_path,))
+    return affected
+
+
+def _cells_from_solver_samples(con: sqlite3.Connection, source_id: str,
+                               max_cells: int = _MAX_SOLVE_CELLS_PER_SOURCE) -> dict:
+    from collections import defaultdict
+    by_sid: dict = defaultdict(dict)
+    rows = con.execute("""SELECT lat,lon,rssi,count FROM source_samples
+                          WHERE source_id=? ORDER BY session_path, seq""", (source_id,)).fetchall()
+    for lat, lon, rssi, count in rows:
+        n = max(1, int(count or 1))
+        cell = {
+            'lat_sum': float(lat or 0.0) * n,
+            'lon_sum': float(lon or 0.0) * n,
+            'rssi_sum': float(rssi if rssi is not None else -100.0) * n,
+            'count': n,
+        }
+        _add_geo_cell_aggregate(by_sid, source_id, cell, max_cells=max_cells)
+    return by_sid.get(source_id, {})
+
+
+def _source_sessions_seen(con: sqlite3.Connection, source_id: str) -> int:
+    row = con.execute('SELECT COUNT(DISTINCT session_path) FROM source_samples WHERE source_id=?',
+                      (source_id,)).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _position_json_meta(con: sqlite3.Connection, source_id: str) -> dict:
+    row = con.execute('SELECT json FROM positions WHERE id=? OR source_id=? LIMIT 1',
+                      (source_id, source_id)).fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def _canonical_position_record(sid: str, cells: dict, meta: dict, *, n_exp: float,
+                               min_obs: int, include_unsolved: bool,
+                               rss_solve, rssi_centroid,
+                               position_id: str | None = None,
+                               source_id: str | None = None) -> dict | None:
+    pid = str(position_id or sid)
+    real_sid = str(source_id or sid)
+    pos_rec = _solve_rss_position(pid, cells, meta, n_exp, min_obs, rss_solve, rssi_centroid)
+    if pos_rec is None and include_unsolved:
+        pos_rec = _source_observation_centroid(
+            pid, cells, meta, reason=f'needs ≥{min_obs} distinct geo-cells for RSS solve')
+    if pos_rec is None:
+        return None
+    pos_rec['id'] = pid
+    pos_rec['source_id'] = real_sid
+    pos_rec['identifier'] = real_sid
+    if pid != real_sid:
+        pos_rec['canonical_id'] = pid
+        pos_rec.setdefault('parent_source_id', real_sid)
+    return pos_rec
+
+
+def _canonical_position_records_for_source(sid: str, cells: dict, meta: dict, *, n_exp: float,
+                                           min_obs: int, include_unsolved: bool,
+                                           rss_solve, rssi_centroid) -> list[dict]:
+    records = []
+    stale_cluster_keys = {'split_reason', 'solve_warning', 'canonical_id', 'parent_source_id'}
+    base_meta = {k: v for k, v in dict(meta or {}).items()
+                 if not str(k).startswith('geo_') and k not in stale_cluster_keys}
+    clusters = _split_source_geo_clusters(sid, cells, min_obs=min_obs)
+    for cl in clusters:
+        cl_meta = _merge_source_meta(dict(base_meta), {})
+        cl_meta.update(dict(cl.get('meta') or {}))
+        pos_rec = _canonical_position_record(
+            sid, cl.get('cells') or {}, cl_meta, n_exp=n_exp, min_obs=min_obs,
+            include_unsolved=include_unsolved, rss_solve=rss_solve, rssi_centroid=rssi_centroid,
+            position_id=cl.get('id') or sid, source_id=cl.get('source_id') or sid)
+        if pos_rec is not None:
+            records.append(pos_rec)
+    return records
 
 
 def _list_solver_dbs() -> list[dict]:
@@ -891,12 +1332,7 @@ def _store_solver_position(con: sqlite3.Connection, rec: dict, cells: dict | Non
         int(rec.get('sample_cells') or 0), int(rec.get('raw_samples') or rec.get('samples') or 0),
         _json_dumps(rec2)))
     if cells is not None:
-        con.execute('DELETE FROM source_samples WHERE position_id=?', (position_id,))
-        rows = _cells_to_sample_rows(position_id, source_id, session_path, cells)
-        if rows:
-            con.executemany("""INSERT OR REPLACE INTO source_samples
-                (position_id,source_id,session_path,seq,lat,lon,rssi,count,json)
-                VALUES(?,?,?,?,?,?,?,?,?)""", rows)
+        _store_solver_samples(con, position_id, source_id, session_path, cells)
 
 
 def _store_solver_path_preview(con: sqlite3.Connection, session_path: str, session_name: str | None = None,
@@ -939,6 +1375,35 @@ def _load_solver_positions(db_path: Path, *, append: bool = False) -> dict:
     return {'ok': True, 'loaded': loaded, 'append': append, 'path': str(db_path), **counts}
 
 
+
+
+def _solver_db_update_status(db_path: Path, *, session_paths: list | tuple | None = None,
+                             max_sessions: int = 500) -> dict:
+    """Summarise whether a DB already contains the selected/current sessions."""
+    sessions = _batch_solve_sessions(max_sessions, session_paths=session_paths)
+    con = sqlite3.connect(db_path)
+    try:
+        _init_solver_db(con)
+        counts = _db_counts(con)
+        rows = []
+        pending = 0
+        unchanged = changed = new = missing = 0
+        for sess in sessions:
+            status, _fp = _session_db_status(con, sess['path'])
+            if status == 'unchanged': unchanged += 1
+            elif status == 'changed': changed += 1; pending += 1
+            elif status == 'new': new += 1; pending += 1
+            elif status == 'missing': missing += 1
+            rows.append({'path': sess['path'], 'name': (sess.get('folder') + '/' if sess.get('folder') else '') + sess.get('name', ''),
+                         'status': status, 'records': sess.get('records'), 'stype': sess.get('stype')})
+        return {**counts, 'path': str(db_path), 'selected_sessions': len(sessions),
+                'pending_sessions': pending, 'unchanged_sessions': unchanged,
+                'changed_sessions': changed, 'new_sessions': new,
+                'missing_sessions': missing, 'up_to_date': pending == 0,
+                'sessions': rows[:250]}
+    finally:
+        con.close()
+
 def _solver_db_paths(db_path: Path) -> list[dict]:
     con = sqlite3.connect(db_path)
     try:
@@ -967,19 +1432,57 @@ def _solver_db_source_samples(db_path: Path, position_id: str = '', source_id: s
     con = sqlite3.connect(db_path)
     try:
         _init_solver_db(con)
+        pos_meta = {}
+        if position_id:
+            row = con.execute('SELECT source_id,json FROM positions WHERE id=? LIMIT 1', (position_id,)).fetchone()
+            if row:
+                if not source_id:
+                    source_id = str(row[0] or '')
+                try:
+                    pos_meta = json.loads(row[1] or '{}')
+                except Exception:
+                    pos_meta = {}
+
+        # Geo-split positions are stored as MAC#geoN but the durable evidence is
+        # keyed by parent source_id/session.  Filter by the selected cluster radius
+        # so clicking geo1 does not draw geo2/outlier links.
+        cluster_filter = False
+        clat = _as_float(pos_meta.get('geo_cluster_center_lat'))
+        clon = _as_float(pos_meta.get('geo_cluster_center_lon'))
+        crad = _as_float(pos_meta.get('geo_cluster_radius_m'), 0.0)
+        if pos_meta.get('geo_clustered') and source_id and clat is not None and clon is not None:
+            cluster_filter = True
+            crad = max(float(crad or 0.0) + _SOLVE_CELL_M * 2.5, _SOLVE_CELL_M * 4.0)
+
         args = []
         where = []
-        if position_id:
+        if cluster_filter:
+            where.append('source_id=?'); args.append(source_id)
+        elif position_id:
             where.append('position_id=?'); args.append(position_id)
-        if source_id:
+        if source_id and not cluster_filter:
             where.append('source_id=?'); args.append(source_id)
         if session_path:
             where.append('session_path=?'); args.append(session_path)
         if not where:
             return []
-        sql = 'SELECT json FROM source_samples WHERE ' + ' AND '.join(where) + ' ORDER BY seq LIMIT ?'
-        args.append(max_obs)
-        return [json.loads(r[0]) for r in con.execute(sql, args).fetchall()]
+        sql = 'SELECT json FROM source_samples WHERE ' + ' AND '.join(where) + ' ORDER BY session_path, seq LIMIT ?'
+        args.append(max_obs * 4 if cluster_filter else max_obs)
+        records = []
+        for (js,) in con.execute(sql, args).fetchall():
+            try:
+                rec = json.loads(js)
+            except Exception:
+                continue
+            if cluster_filter:
+                la = _as_float(rec.get('lat')); lo = _as_float(rec.get('lon'))
+                if la is None or lo is None or _distance_m(clat, clon, la, lo) > crad:
+                    continue
+                rec['geo_cluster_selected'] = position_id
+            records.append(rec)
+            if len(records) >= max_obs:
+                break
+        return records
     finally:
         con.close()
 
@@ -1225,180 +1728,302 @@ def _run_batch_solver(max_cells: int = _MAX_SOLVE_CELLS_PER_SOURCE,
                       max_sessions: int = 500,
                       n_exp: float = 2.5,
                       min_obs: int = 3,
-                      include_unsolved: bool = True) -> None:
-    """Pi-friendly bulk solver for many saved sessions.
+                      include_unsolved: bool = True,
+                      session_paths: list | tuple | None = None) -> None:
+    """Pi-friendly global bulk solver for many saved sessions.
 
-    It runs in the same background slot as the normal solver so status/Stop work
-    and HTTP requests do not block until every fat JSONL is processed.
+    Bulk now deduplicates by real source id/MAC across all indexed sessions.  A
+    source seen in five session files becomes one canonical position row, with
+    per-session evidence retained in source_samples for popup/sample lookup and
+    incremental DB updates.
     """
     from collections import defaultdict
     from aetherward.position.rss import rss_solve, rssi_centroid
-    from aetherward.session import is_gps_record, record_source_id, source_meta_from_record
 
-    sessions = _batch_solve_sessions(max_sessions)
+    sessions = _batch_solve_sessions(max_sessions, session_paths=session_paths)
+    global_cells: dict = defaultdict(dict)
+    global_meta: dict = {}
+    source_sessions: dict[str, set[str]] = defaultdict(set)
+    total_records = 0
+    total_geo = 0
     total_solved = 0
     total_indexed = 0
-    total_records = 0
     db_con = None
     db_path = None
     try:
-        db_path = _create_solver_db('bulk', mode='bulk', settings={'max_cells': max_cells, 'max_sessions': max_sessions, 'n_exp': n_exp, 'min_obs': min_obs, 'include_unsolved': include_unsolved})
+        db_path = _create_solver_db('bulk', mode='bulk', settings={'max_cells': max_cells, 'max_sessions': max_sessions, 'n_exp': n_exp, 'min_obs': min_obs, 'include_unsolved': include_unsolved, 'merge_by_source': True, 'geo_guard': True, 'selected_sessions': len(sessions)})
         db_con = sqlite3.connect(db_path)
         _init_solver_db(db_con)
-        _broadcast_log(f'[solver-db] writing bulk solved DB: {Path(db_path).name}', 'solve')
+        _broadcast_log(f'[solver-db] writing global bulk solved DB: {Path(db_path).name}', 'solve')
     except Exception as exc:
         _broadcast_log(f'[solver-db] disabled: {type(exc).__name__}: {exc}', 'solve')
         db_con = None
+
     _broadcast_progress(running=True, phase='batch-start', pct=0.0,
-                        text=f'Starting bulk solve: {len(sessions)} sessions')
+                        text=f'Starting global bulk solve: {len(sessions)} sessions')
     _broadcast_log(
-        f'[batch] starting {len(sessions)} session(s), ≤{max_cells} geo-cells/source, '
-        f'min_obs={min_obs}, n_exp={n_exp:g}, include_unsolved={include_unsolved}; '
-        f'auto-loading lightweight route previews',
+        f'[batch] starting {len(sessions)} selected session(s), merge_by_source=true+geo_guard, '
+        f'≤{max_cells} geo-cells/source, min_obs={min_obs}, n_exp={n_exp:g}, '
+        f'include_unsolved={include_unsolved}; route previews are stored once/session',
         'solve')
     try:
+        # Pass 1: index every session and persist per-session evidence.
         for sess_i, sess in enumerate(sessions, 1):
             if _solve_stop.is_set():
                 _broadcast_log('[batch] stopped by user', 'solve')
                 break
-            rss_cells: dict = defaultdict(dict)
-            rss_meta: dict = {}
-            rec_n = geo_n = 0
             try:
-                sess_size = max(1, int(sess.get('size') or Path(sess['path']).stat().st_size))
-                last_prog = 0.0
-                with open(sess['path'], encoding='utf-8', errors='replace') as fh:
-                    while True:
-                        if _solve_stop.is_set():
-                            break
-                        raw = fh.readline()
-                        if not raw:
-                            break
-                        pos_now = fh.tell()
-                        raw = raw.strip()
-                        if not raw:
-                            continue
-                        try:
-                            rec = json.loads(raw)
-                        except ValueError:
-                            continue
-                        rec_n += 1
-                        if is_gps_record(rec):
-                            continue
-                        sid = record_source_id(rec)
-                        if rec.get('lat') is not None and rec.get('lon') is not None:
-                            geo_n += 1
-                            _add_geo_observation(
-                                rss_cells, sid, rec.get('lat'), rec.get('lon'),
-                                rec.get('rssi', -100.0), max_cells=max_cells)
-                        rss_meta[sid] = _merge_source_meta(rss_meta.get(sid, {}), source_meta_from_record(rec))
-                        rss_meta[sid].setdefault('ssid', '')
-                        rss_meta[sid].setdefault('protocol', '')
-                        now = time.time()
-                        if now - last_prog > 0.8:
-                            base = (sess_i - 1) / max(1, len(sessions)) * 100.0
-                            span = 100.0 / max(1, len(sessions))
-                            pct = min(99.0, base + span * 0.75 * (pos_now / sess_size))
-                            _broadcast_progress(running=True, phase='batch-indexing', pct=pct,
-                                                text=f'Bulk {sess_i}/{len(sessions)} indexing {sess["name"]}: {rec_n} records, {len(rss_cells)} sources')
-                            last_prog = now
-                            time.sleep(0)
+                def _prog(rec_n, src_n, frac, sess_i=sess_i, sess=sess):
+                    base = (sess_i - 1) / max(1, len(sessions)) * 70.0
+                    span = 70.0 / max(1, len(sessions))
+                    _broadcast_progress(running=True, phase='batch-indexing',
+                                        pct=min(69.0, base + span * max(0.0, min(1.0, frac))),
+                                        text=f'Bulk {sess_i}/{len(sessions)} indexing {sess["name"]}: {rec_n} records, {src_n} sources')
+
+                rss_cells, rss_meta, rec_n, geo_n = _index_session_for_solver(
+                    sess, max_cells=max_cells, progress_cb=_prog)
             except Exception as exc:
-                _broadcast_log(f'[batch] skip {sess["name"]}: {exc}', 'solve')
+                _broadcast_log(f'[batch] skip {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
                 continue
 
-            solved_this = 0
-            indexed_this = 0
-            skipped_this = 0
-            total_sources_this = max(1, len(rss_cells))
-            for source_i, (sid, cells) in enumerate(rss_cells.items(), 1):
-                if _solve_stop.is_set():
-                    break
-                if source_i == 1 or source_i == total_sources_this or source_i % 100 == 0:
-                    base = (sess_i - 1) / max(1, len(sessions)) * 100.0
-                    span = 100.0 / max(1, len(sessions))
-                    _broadcast_progress(running=True, phase='batch-solving',
-                                        pct=min(99.0, base + span * (0.75 + 0.24 * source_i / total_sources_this)),
-                                        text=f'Bulk {sess_i}/{len(sessions)} solving {source_i}/{total_sources_this}: {sess["name"]}')
-                    time.sleep(0)
-                try:
-                    pos_rec = _solve_rss_position(
-                        sid, cells, rss_meta.get(sid, {}), n_exp, min_obs,
-                        rss_solve, rssi_centroid)
-                except Exception as exc:
-                    skipped_this += 1
-                    _broadcast_log(f'[batch] source#{_anon_source_id(sid)} crashed in {sess["name"]}: '
-                                   f'{type(exc).__name__}: {exc}', 'solve')
-                    continue
-                if pos_rec is None:
-                    if include_unsolved:
-                        pos_rec = _source_observation_centroid(
-                            sid, cells, rss_meta.get(sid, {}),
-                            reason=f'needs ≥{min_obs} distinct geo-cells for RSS solve')
-                    if pos_rec is None:
-                        skipped_this += 1
-                        continue
-                # In batch mode the same AP/client MAC can legitimately appear
-                # in several session files.  The browser/server state is keyed
-                # by `id`, so keep the real MAC in source_id/identifier and give
-                # each session's solved marker a stable namespaced id.
+            for sid, cells in rss_cells.items():
                 real_sid = str(sid)
-                pos_rec['source_id'] = real_sid
-                pos_rec['identifier'] = real_sid
-                pos_rec['session_path'] = sess['path']
-                pos_rec['session_name'] = sess['name']
-                if sess.get('folder'):
-                    pos_rec['session_folder'] = sess.get('folder')
-                pos_rec['id'] = _batch_marker_id(real_sid, sess['path'])
+                _merge_source_cells(global_cells, real_sid, cells, max_cells=max_cells)
+                global_meta[real_sid] = _merge_source_meta(global_meta.get(real_sid, {}), rss_meta.get(sid, {}))
+                source_sessions[real_sid].add(sess['path'])
+                if db_con is not None:
+                    try:
+                        _store_solver_samples(db_con, real_sid, real_sid, sess['path'], cells)
+                    except Exception as exc:
+                        _broadcast_log(f'[solver-db] sample store failed for source#{_anon_source_id(real_sid)} in {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
+            total_records += rec_n
+            total_geo += geo_n
+            _broadcast_log(
+                f'[batch] {sess_i}/{len(sessions)} {sess["name"]}: indexed {len(rss_cells)} source(s), '
+                f'{geo_n}/{rec_n} geo observation record(s)', 'solve')
+            if db_con is not None:
+                try:
+                    _store_solver_path_preview(db_con, sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True, max_points=_MAP_BULK_PREVIEW_POINTS)
+                    _store_solver_session_manifest(db_con, sess, record_count=rec_n, source_count=len(rss_cells))
+                    db_con.commit()
+                except Exception as exc:
+                    _broadcast_log(f'[solver-db] path/session store failed for {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
+            _broadcast_path_ready(sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True)
+
+        # Pass 2: solve each real source exactly once using all sessions' cells.
+        source_items = list(global_cells.items())
+        skipped = 0
+        for source_i, (sid, cells) in enumerate(source_items, 1):
+            if _solve_stop.is_set():
+                _broadcast_log('[batch] stopped by user during global solve', 'solve')
+                break
+            if source_i == 1 or source_i == len(source_items) or source_i % 100 == 0:
+                _broadcast_progress(running=True, phase='batch-solving',
+                                    pct=min(99.0, 70.0 + 29.0 * source_i / max(1, len(source_items))),
+                                    text=f'Global solve {source_i}/{len(source_items)} source(s), current #{_anon_source_id(sid)}')
+                time.sleep(0)
+            try:
+                pos_recs = _canonical_position_records_for_source(
+                    sid, cells, global_meta.get(sid, {}), n_exp=n_exp, min_obs=min_obs,
+                    include_unsolved=include_unsolved, rss_solve=rss_solve, rssi_centroid=rssi_centroid)
+            except Exception as exc:
+                skipped += 1
+                _broadcast_log(f'[batch] source#{_anon_source_id(sid)} crashed in geo-guard/global solve: {type(exc).__name__}: {exc}', 'solve')
+                continue
+            if not pos_recs:
+                skipped += 1
+                continue
+            if len(pos_recs) > 1:
+                _broadcast_log(f'[batch] source#{_anon_source_id(sid)} split into {len(pos_recs)} geo-consistent cluster(s); MAC-only merge refused', 'solve')
+            if db_con is not None:
+                try:
+                    db_con.execute('DELETE FROM positions WHERE source_id=? OR id=?', (sid, sid))
+                except Exception:
+                    pass
+            for pos_rec in pos_recs:
+                pos_rec['session_path'] = ''
+                pos_rec['session_name'] = f'{len(source_sessions.get(sid, set()))} session(s)'
+                pos_rec['sessions_seen'] = len(source_sessions.get(sid, set()))
                 if db_path:
                     pos_rec['solver_db_path'] = str(db_path)
                     pos_rec['from_solver_db_capable'] = True
                 _broadcast(pos_rec)
                 if db_con is not None:
                     try:
-                        _store_solver_position(db_con, pos_rec, cells)
-                        if (solved_this + indexed_this) % 50 == 0: db_con.commit()
+                        _store_solver_position(db_con, pos_rec, None)
+                        if (total_solved + total_indexed) % 50 == 0:
+                            db_con.commit()
                     except Exception as exc:
-                        _broadcast_log(f'[solver-db] store failed for source#{_anon_source_id(real_sid)} in {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
+                        _broadcast_log(f'[solver-db] position store failed for source#{_anon_source_id(sid)}: {type(exc).__name__}: {exc}', 'solve')
                 if pos_rec.get('unsolved'):
                     total_indexed += 1
-                    indexed_this += 1
                 else:
                     total_solved += 1
-                    solved_this += 1
-
-            total_records += rec_n
-            _broadcast_log(
-                f'[batch] {sess_i}/{len(sessions)} {sess["name"]}: '
-                f'{solved_this} solved, {indexed_this} evidence-centroid, '
-                f'{skipped_this} skipped, {geo_n}/{rec_n} geo observation record(s), '
-                f'≤{max_cells} cells/source',
-                'solve')
-            if db_con is not None:
-                try:
-                    _store_solver_path_preview(db_con, sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True, max_points=_MAP_BULK_PREVIEW_POINTS)
-                    db_con.commit()
-                except Exception as exc:
-                    _broadcast_log(f'[solver-db] path store failed for {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
-            _broadcast_path_ready(sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True)
+        if skipped:
+            _broadcast_log(f'[batch] skipped {skipped} source(s) during global solve', 'solve')
     finally:
         if db_con is not None:
             try:
                 db_con.commit()
                 cnt = _db_counts(db_con)
-                _broadcast_log(f'[solver-db] saved {cnt["positions"]} positions, {cnt["samples"]} sample-cells, {cnt["paths"]} path(s) → {Path(db_path).name}', 'solve')
+                _broadcast_log(f'[solver-db] saved {cnt["positions"]} canonical positions, {cnt["samples"]} sample-cells, {cnt["sessions"]} session(s), {cnt["paths"]} path(s) → {Path(db_path).name}', 'solve')
             except Exception as exc:
                 _broadcast_log(f'[solver-db] final save failed: {type(exc).__name__}: {exc}', 'solve')
             finally:
                 try: db_con.close()
                 except Exception: pass
         _broadcast_progress(running=False, phase='done', pct=100.0,
-                            text=f'Bulk done: {total_solved} real positions, {total_indexed} evidence markers')
+                            text=f'Bulk done: {total_solved} canonical positions, {total_indexed} evidence markers')
         _broadcast_log(
-            f'[batch] done — {total_solved} RSS-solved source(s), '
-            f'{total_indexed} evidence-centroid source(s) from {len(sessions)} session(s), '
-            f'{total_records} record(s) scanned',
+            f'[batch] done — {total_solved} RSS-solved canonical source(s), '
+            f'{total_indexed} evidence-centroid source(s), {len(global_cells)} unique source(s), '
+            f'{len(sessions)} session(s), {total_geo}/{total_records} geo observation record(s)',
             'solve')
+
+
+def _run_solver_db_update(db_path: str, max_cells: int = _MAX_SOLVE_CELLS_PER_SOURCE,
+                          max_sessions: int = 500,
+                          n_exp: float = 2.5,
+                          min_obs: int = 3,
+                          include_unsolved: bool = True,
+                          session_paths: list | tuple | None = None) -> None:
+    """Incrementally update an existing solved DB with new/changed sessions."""
+    from aetherward.position.rss import rss_solve, rssi_centroid
+
+    p = Path(db_path)
+    sessions = _batch_solve_sessions(max_sessions, session_paths=session_paths)
+    changed_sessions = 0
+    skipped_unchanged = 0
+    missing_sessions = 0
+    total_records = 0
+    affected_sources: set[str] = set()
+    meta_updates: dict = {}
+    con = None
+    _broadcast_progress(running=True, phase='db-update-start', pct=0.0,
+                        text=f'Updating {p.name} from session manifest')
+    try:
+        con = sqlite3.connect(p)
+        _init_solver_db(con)
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('updated_at',?)", (time.strftime('%Y-%m-%d %H:%M:%S'),))
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('mode',?)", ('incremental',))
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('settings',?)", (_json_dumps({'max_cells': max_cells, 'max_sessions': max_sessions, 'n_exp': n_exp, 'min_obs': min_obs, 'include_unsolved': include_unsolved, 'merge_by_source': True, 'geo_guard': True, 'selected_sessions': len(sessions)}),))
+        _broadcast_log(f'[solver-db] updating DB in place: {p.name} from {len(sessions)} selected session(s)', 'solve')
+
+        # Ingest only new/changed session files; unchanged manifest rows are skipped.
+        for sess_i, sess in enumerate(sessions, 1):
+            if _solve_stop.is_set():
+                _broadcast_log('[solver-db] update stopped by user', 'solve')
+                break
+            status, _fp = _session_db_status(con, sess['path'])
+            if status == 'missing':
+                missing_sessions += 1
+                continue
+            if status == 'unchanged':
+                skipped_unchanged += 1
+                continue
+            old_sources = _delete_session_contribution(con, sess['path']) if status == 'changed' else set()
+            affected_sources.update(old_sources)
+            try:
+                def _prog(rec_n, src_n, frac, sess_i=sess_i, sess=sess, status=status):
+                    _broadcast_progress(running=True, phase='db-update-indexing',
+                                        pct=min(75.0, 75.0 * sess_i / max(1, len(sessions)) * max(0.05, frac)),
+                                        text=f'Update {status} {sess_i}/{len(sessions)} {sess["name"]}: {rec_n} records, {src_n} sources')
+
+                rss_cells, rss_meta, rec_n, geo_n = _index_session_for_solver(
+                    sess, max_cells=max_cells, progress_cb=_prog)
+            except Exception as exc:
+                _broadcast_log(f'[solver-db] skip {sess["name"]}: {type(exc).__name__}: {exc}', 'solve')
+                continue
+            changed_sessions += 1
+            total_records += rec_n
+            for sid, cells in rss_cells.items():
+                real_sid = str(sid)
+                _store_solver_samples(con, real_sid, real_sid, sess['path'], cells)
+                affected_sources.add(real_sid)
+                meta_updates[real_sid] = _merge_source_meta(meta_updates.get(real_sid, {}), rss_meta.get(sid, {}))
+            _store_solver_path_preview(con, sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True, max_points=_MAP_BULK_PREVIEW_POINTS)
+            _store_solver_session_manifest(con, sess, record_count=rec_n, source_count=len(rss_cells))
+            con.commit()
+            _broadcast_path_ready(sess['path'], (sess.get('folder') + '/' if sess.get('folder') else '') + sess['name'], overview=True)
+            _broadcast_log(f'[solver-db] ingested {status} session {sess["name"]}: {len(rss_cells)} source(s), {geo_n}/{rec_n} geo observation record(s)', 'solve')
+
+        if not affected_sources:
+            cnt = _db_counts(con)
+            _broadcast_log(f'[solver-db] no new/changed sessions. skipped={skipped_unchanged}, missing={missing_sessions}; DB unchanged.', 'solve')
+            con.commit()
+            con.close(); con = None
+            _load_solver_positions(p, append=False)
+            _broadcast_progress(running=False, phase='done', pct=100.0,
+                                text=f'No update needed: {cnt["positions"]} positions already current')
+            return
+
+        # Recompute only touched sources from all evidence currently in the DB.
+        solved = indexed = removed = errors = 0
+        affected = sorted(affected_sources)
+        for i, sid in enumerate(affected, 1):
+            if _solve_stop.is_set():
+                _broadcast_log('[solver-db] update stopped during source recompute', 'solve')
+                break
+            if i == 1 or i == len(affected) or i % 50 == 0:
+                _broadcast_progress(running=True, phase='db-update-solving',
+                                    pct=min(99.0, 75.0 + 24.0 * i / max(1, len(affected))),
+                                    text=f'Recomputing touched sources {i}/{len(affected)}')
+            cells = _cells_from_solver_samples(con, sid, max_cells=max_cells)
+            if not cells:
+                con.execute('DELETE FROM positions WHERE id=? OR source_id=?', (sid, sid))
+                _broadcast_remove(sid)
+                removed += 1
+                continue
+            meta = _merge_source_meta(_position_json_meta(con, sid), meta_updates.get(sid, {}))
+            try:
+                pos_recs = _canonical_position_records_for_source(
+                    sid, cells, meta, n_exp=n_exp, min_obs=min_obs,
+                    include_unsolved=include_unsolved, rss_solve=rss_solve, rssi_centroid=rssi_centroid)
+            except Exception as exc:
+                errors += 1
+                _broadcast_log(f'[solver-db] source#{_anon_source_id(sid)} recompute failed in geo-guard: {type(exc).__name__}: {exc}', 'solve')
+                continue
+            if not pos_recs:
+                con.execute('DELETE FROM positions WHERE id=? OR source_id=?', (sid, sid))
+                _broadcast_remove(sid)
+                removed += 1
+                continue
+            seen = _source_sessions_seen(con, sid)
+            con.execute('DELETE FROM positions WHERE source_id=? OR id=?', (sid, sid))
+            if len(pos_recs) > 1:
+                _broadcast_log(f'[solver-db] source#{_anon_source_id(sid)} split into {len(pos_recs)} geo-consistent cluster(s); MAC-only merge refused', 'solve')
+            for pos_rec in pos_recs:
+                pos_rec['session_path'] = ''
+                pos_rec['session_name'] = f'{seen} session(s)'
+                pos_rec['sessions_seen'] = seen
+                pos_rec['solver_db_path'] = str(p)
+                pos_rec['from_solver_db_capable'] = True
+                _store_solver_position(con, pos_rec, None)
+                if pos_rec.get('unsolved'):
+                    indexed += 1
+                else:
+                    solved += 1
+            if i % 50 == 0:
+                con.commit()
+        con.commit()
+        cnt = _db_counts(con)
+        _broadcast_log(
+            f'[solver-db] update complete: {changed_sessions} session(s) ingested, '
+            f'{skipped_unchanged} unchanged skipped, {len(affected)} source(s) touched, '
+            f'{solved} solved, {indexed} evidence, {removed} removed, {errors} errors. '
+            f'DB now has {cnt["positions"]} positions / {cnt["sessions"]} sessions.', 'solve')
+        con.close(); con = None
+        _load_solver_positions(p, append=False)
+        _broadcast_progress(running=False, phase='done', pct=100.0,
+                            text=f'DB updated: {cnt["positions"]} positions, {cnt["sessions"]} sessions')
+    except Exception as exc:
+        _broadcast_log(f'[solver-db] update failed: {type(exc).__name__}: {exc}', 'solve')
+        _broadcast_progress(running=False, phase='error', pct=0.0,
+                            text=f'DB update failed: {type(exc).__name__}')
+    finally:
+        if con is not None:
+            try: con.close()
+            except Exception: pass
 
 
 # ── Capture run thread ────────────────────────────────────────────────────────
@@ -1665,6 +2290,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not db or not db.exists():
                 self._json({'error': 'db not found'}, 404); return
             self._json(_solver_db_paths(db))
+        elif p == '/api/solver/db_status':
+            db = _solver_db_rel_or_path((qs.get('path') or [''])[0].strip())
+            if not db or not db.exists():
+                self._json({'error': 'db not found'}, 404); return
+            selected = qs.get('session') or []
+            max_sessions = _safe_int((qs.get('max_sessions') or [''])[0], 500, 1, 5000)
+            self._json(_solver_db_update_status(db, session_paths=selected, max_sessions=max_sessions))
         elif p == '/api/solver/path_records':
             db = _solver_db_rel_or_path((qs.get('db') or [''])[0].strip())
             spath = (qs.get('session_path') or [''])[0].strip()
@@ -1826,17 +2458,46 @@ class _Handler(BaseHTTPRequestHandler):
                 n_exp = 2.5
             min_obs = _safe_int(data.get('min_obs'), 3, 1, 1000)
             include_unsolved = bool(data.get('include_unsolved', True))
+            selected_sessions = data.get('sessions') if isinstance(data.get('sessions'), list) else []
             _solve_stop.set()
             if _solve_thread and _solve_thread.is_alive():
                 _solve_thread.join(timeout=3)
             _solve_stop.clear(); _solve_session = 'batch'; _solve_follow = False
             _clear_auto_positions('bulk-solve-start')
             _solve_thread = threading.Thread(
-                target=_run_batch_solver, args=(max_cells, max_sessions, n_exp, min_obs, include_unsolved), daemon=True)
+                target=_run_batch_solver, args=(max_cells, max_sessions, n_exp, min_obs, include_unsolved, selected_sessions), daemon=True)
             _solve_thread.start()
-            sessions = _batch_solve_sessions(max_sessions)
+            sessions = _batch_solve_sessions(max_sessions, session_paths=selected_sessions)
             self._json({'ok': True, 'started': True, 'max_cells_per_source': max_cells,
                         'max_sessions': max_sessions, 'n_exp': n_exp, 'min_obs': min_obs,
+                        'include_unsolved': include_unsolved, 'merge_by_source': True,
+                        'sessions': sessions})
+
+        elif p == '/api/solver/update_sessions':
+            db = _solver_db_rel_or_path(str(data.get('path') or '').strip())
+            if not db or not db.exists():
+                self._json({'error': 'db not found'}, 404); return
+            max_cells = _safe_int(data.get('max_cells'), _MAX_SOLVE_CELLS_PER_SOURCE, 16, 2048)
+            max_sessions = _safe_int(data.get('max_sessions'), 500, 1, 5000)
+            try:
+                n_exp = float(data.get('n_exp', 2.5))
+            except (TypeError, ValueError):
+                n_exp = 2.5
+            min_obs = _safe_int(data.get('min_obs'), 3, 1, 1000)
+            include_unsolved = bool(data.get('include_unsolved', True))
+            selected_sessions = data.get('sessions') if isinstance(data.get('sessions'), list) else []
+            _solve_stop.set()
+            if _solve_thread and _solve_thread.is_alive():
+                _solve_thread.join(timeout=3)
+            _solve_stop.clear(); _solve_session = 'db-update'; _solve_follow = False
+            _clear_auto_positions('solver-db-update-start')
+            _solve_thread = threading.Thread(
+                target=_run_solver_db_update, args=(str(db), max_cells, max_sessions, n_exp, min_obs, include_unsolved, selected_sessions), daemon=True)
+            _solve_thread.start()
+            sessions = _batch_solve_sessions(max_sessions, session_paths=selected_sessions)
+            self._json({'ok': True, 'started': True, 'path': str(db),
+                        'max_cells_per_source': max_cells, 'max_sessions': max_sessions,
+                        'n_exp': n_exp, 'min_obs': min_obs,
                         'include_unsolved': include_unsolved, 'sessions': sessions})
 
         # ── Capture run ────────────────────────────────────────────────────────
